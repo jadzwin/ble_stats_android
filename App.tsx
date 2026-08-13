@@ -6,6 +6,7 @@ import {
   Platform,
   SafeAreaView,
   ScrollView,
+  StatusBar,
   Share,
   StyleSheet,
   Text,
@@ -610,7 +611,7 @@ export default function App() {
 
   const shareReport = useCallback(async () => {
     const report = [
-      'ECUMaster BLE RX Stats v1.1',
+      'ECUMaster BLE RX Stats v1.2',
       `generated=${new Date().toISOString()}`,
       `state=${connectionState}`,
       `status=${statusText}`,
@@ -716,8 +717,9 @@ export default function App() {
 
   return (
     <SafeAreaView style={styles.safeArea}>
+      <StatusBar barStyle="dark-content" backgroundColor="#f2f3f5" />
       <ScrollView contentContainerStyle={styles.container}>
-        <Text style={styles.title}>ECUMaster BLE RX Stats v1.1</Text>
+        <Text style={styles.title}>ECUMaster BLE RX Stats v1.2</Text>
         <Text style={styles.subtitle}>
           Najpierw skan wszystkich urządzeń BLE, potem ręczny wybór. Po połączeniu: High connection
           priority, MTU request i test RX-only.
@@ -726,7 +728,7 @@ export default function App() {
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>Połączenie</Text>
           <Text style={styles.status}>{connectionState}</Text>
-          <Text>{statusText}</Text>
+          <Text style={styles.bodyText}>{statusText}</Text>
           {['waiting-for-bluetooth', 'connecting', 'discovering', 'subscribing'].includes(
             connectionState,
           ) ? (
@@ -900,6 +902,7 @@ const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
     backgroundColor: '#f2f3f5',
+    paddingTop: Platform.OS === 'android' ? StatusBar.currentHeight ?? 0 : 0,
   },
   container: {
     padding: 14,
@@ -909,10 +912,12 @@ const styles = StyleSheet.create({
   title: {
     fontSize: 24,
     fontWeight: '700',
+    color: '#111827',
   },
   subtitle: {
     fontSize: 14,
     lineHeight: 20,
+    color: '#374151',
   },
   card: {
     backgroundColor: '#ffffff',
@@ -924,10 +929,15 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: '700',
     marginBottom: 2,
+    color: '#111827',
   },
   status: {
     fontWeight: '700',
     textTransform: 'uppercase',
+    color: '#111827',
+  },
+  bodyText: {
+    color: '#111827',
   },
   spinner: {
     marginVertical: 6,
@@ -955,6 +965,7 @@ const styles = StyleSheet.create({
     fontFamily: Platform.select({ android: 'monospace', default: 'Courier' }),
     fontSize: 12,
     lineHeight: 18,
+    color: '#111827',
   },
   channelBox: {
     borderWidth: StyleSheet.hairlineWidth,
@@ -966,6 +977,7 @@ const styles = StyleSheet.create({
   channelTitle: {
     fontWeight: '700',
     marginBottom: 2,
+    color: '#111827',
   },
   deviceBox: {
     borderWidth: StyleSheet.hairlineWidth,
@@ -978,6 +990,7 @@ const styles = StyleSheet.create({
   deviceName: {
     fontSize: 16,
     fontWeight: '700',
+    color: '#111827',
   },
   deviceButton: {
     marginTop: 6,

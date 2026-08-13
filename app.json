@@ -2,11 +2,13 @@
   "expo": {
     "name": "ECUMaster BLE RX Stats",
     "slug": "ecumaster-ble-rx-stats",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "newArchEnabled": false,
+    "userInterfaceStyle": "light",
     "android": {
       "package": "com.ecumaster.blerxstats",
-      "versionCode": 2,
+      "userInterfaceStyle": "light",
+      "versionCode": 3,
       "permissions": [
         "android.permission.BLUETOOTH_SCAN",
         "android.permission.BLUETOOTH_CONNECT",
