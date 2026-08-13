@@ -1,0 +1,28 @@
+{
+  "name": "ecumaster-ble-rx-stats",
+  "version": "1.0.0",
+  "private": true,
+  "main": "expo/AppEntry.js",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "prebuild": "expo prebuild",
+    "typecheck": "tsc --noEmit",
+    "build:android:release": "expo prebuild --clean --platform android && cd android && ./gradlew assembleRelease --no-daemon"
+  },
+  "dependencies": {
+    "base64-js": "1.5.1",
+    "expo": "~54.0.35",
+    "react": "19.1.0",
+    "react-native": "0.81.5",
+    "react-native-ble-plx": "3.5.1"
+  },
+  "devDependencies": {
+    "@types/react": "~19.1.10",
+    "babel-preset-expo": "~54.0.10",
+    "typescript": "~5.9.2"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  }
+}

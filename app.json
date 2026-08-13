@@ -1,0 +1,26 @@
+{
+  "expo": {
+    "name": "ECUMaster BLE RX Stats",
+    "slug": "ecumaster-ble-rx-stats",
+    "version": "1.0.0",
+    "newArchEnabled": false,
+    "android": {
+      "package": "com.ecumaster.blerxstats",
+      "versionCode": 1,
+      "permissions": [
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.ACCESS_FINE_LOCATION"
+      ]
+    },
+    "plugins": [
+      [
+        "react-native-ble-plx",
+        {
+          "isBackgroundEnabled": false,
+          "neverForLocation": false
+        }
+      ]
+    ]
+  }
+}
