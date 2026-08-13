@@ -35,6 +35,7 @@ type ConnectionState =
   | 'idle'
   | 'waiting-for-bluetooth'
   | 'scanning'
+  | 'scan-results'
   | 'connecting'
   | 'discovering'
   | 'subscribing'
@@ -54,19 +55,43 @@ interface ConnectedInfo {
   connectedAtIso: string;
 }
 
+interface ScanDeviceRow {
+  id: string;
+  name: string | null;
+  localName: string | null;
+  rssi: number | null;
+  isConnectable: boolean | null;
+  serviceUUIDs: string[] | null;
+}
+
 function normalizedUuid(uuid: string): string {
   return uuid.trim().toLowerCase();
 }
 
-function deviceMatches(device: Device): boolean {
-  const wantedId = BLE_CONFIG.targetDeviceId.trim().toUpperCase();
-  const wantedName = BLE_CONFIG.targetDeviceName.trim().toUpperCase();
-  const idMatches = wantedId.length > 0 && device.id.toUpperCase() === wantedId;
-  const names = [device.name, device.localName]
-    .filter((value): value is string => typeof value === 'string')
-    .map((value) => value.toUpperCase());
-  const nameMatches = wantedName.length > 0 && names.includes(wantedName);
-  return idMatches || nameMatches;
+function deviceDisplayName(device: Pick<ScanDeviceRow, 'id' | 'name' | 'localName'>): string {
+  return device.localName ?? device.name ?? '(bez nazwy)';
+}
+
+function deviceToRow(device: Device): ScanDeviceRow {
+  return {
+    id: device.id,
+    name: device.name ?? null,
+    localName: device.localName ?? null,
+    rssi: device.rssi ?? null,
+    isConnectable: device.isConnectable ?? null,
+    serviceUUIDs: device.serviceUUIDs ?? null,
+  };
+}
+
+function sortDevices(rows: ScanDeviceRow[]): ScanDeviceRow[] {
+  return rows.sort((a, b) => {
+    const aRssi = a.rssi ?? -999;
+    const bRssi = b.rssi ?? -999;
+    if (aRssi !== bRssi) {
+      return bRssi - aRssi;
+    }
+    return deviceDisplayName(a).localeCompare(deviceDisplayName(b));
+  });
 }
 
 async function requestAndroidPermissions(): Promise<boolean> {
@@ -240,24 +265,50 @@ export default function App() {
   const monitorSubscriptionRef = useRef<Subscription | null>(null);
   const disconnectSubscriptionRef = useRef<Subscription | null>(null);
   const scanTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scanUiTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const discoveredDeviceObjectsRef = useRef<Map<string, Device>>(new Map());
+  const discoveredRowsRef = useRef<Map<string, ScanDeviceRow>>(new Map());
   const connectingRef = useRef(false);
-  const scanMatchHandledRef = useRef(false);
   const connectedDeviceIdRef = useRef<string | null>(null);
   const intentionalDisconnectRef = useRef(false);
 
   const [connectionState, setConnectionState] = useState<ConnectionState>('idle');
-  const [statusText, setStatusText] = useState('Gotowy. Test jest tylko RX — aplikacja niczego nie wysyła.');
+  const [statusText, setStatusText] = useState(
+    'Gotowy. Najpierw zeskanuj BLE, wybierz urządzenie z listy i kliknij Połącz.',
+  );
   const [errorText, setErrorText] = useState<string | null>(null);
   const [connectedInfo, setConnectedInfo] = useState<ConnectedInfo | null>(null);
+  const [scanDevices, setScanDevices] = useState<ScanDeviceRow[]>([]);
   const [stats, setStats] = useState<BleStatsSnapshot>(() => emptySnapshot());
+
+  const refreshScanList = useCallback(() => {
+    setScanDevices(sortDevices(Array.from(discoveredRowsRef.current.values())));
+  }, []);
 
   const stopScan = useCallback(() => {
     if (scanTimeoutRef.current !== null) {
       clearTimeout(scanTimeoutRef.current);
       scanTimeoutRef.current = null;
     }
+    if (scanUiTimerRef.current !== null) {
+      clearInterval(scanUiTimerRef.current);
+      scanUiTimerRef.current = null;
+    }
     void manager.stopDeviceScan().catch(() => undefined);
   }, [manager]);
+
+  const finishScan = useCallback(
+    (message?: string) => {
+      stopScan();
+      refreshScanList();
+      setConnectionState('scan-results');
+      setStatusText(
+        message ??
+          `Skan zakończony. Znaleziono ${discoveredRowsRef.current.size} urządzeń. Wybierz urządzenie i kliknij Połącz.`,
+      );
+    },
+    [refreshScanList, stopScan],
+  );
 
   const removeSubscriptions = useCallback(() => {
     monitorSubscriptionRef.current?.remove();
@@ -270,7 +321,7 @@ export default function App() {
     async (device: Device, scanRssi: number | null): Promise<void> => {
       setConnectionState('discovering');
       setStatusText('Wykrywanie usług i charakterystyk…');
-      let preparedDevice = await device.discoverAllServicesAndCharacteristics();
+      const preparedDevice = await device.discoverAllServicesAndCharacteristics();
 
       const services = await preparedDevice.services();
       const preferredService = normalizedUuid(BLE_CONFIG.preferredServiceUuid);
@@ -327,7 +378,7 @@ export default function App() {
       const connectedAtIso = new Date().toISOString();
       setConnectedInfo({
         id: preparedDevice.id,
-        name: preparedDevice.name ?? preparedDevice.localName ?? BLE_CONFIG.targetDeviceName,
+        name: preparedDevice.localName ?? preparedDevice.name ?? '(bez nazwy)',
         scanRssi,
         mtu: preparedDevice.mtu,
         serviceUuid: notifyCharacteristic.serviceUUID,
@@ -370,7 +421,7 @@ export default function App() {
           monitorSubscriptionRef.current = null;
           if (intentionalDisconnectRef.current) {
             setConnectionState('disconnected');
-            setStatusText('Rozłączono ręcznie.');
+            setStatusText('Rozłączono ręcznie. Możesz ponownie uruchomić skan BLE.');
             return;
           }
           setConnectionState('disconnected');
@@ -391,7 +442,7 @@ export default function App() {
   const connectFoundDevice = useCallback(
     async (scannedDevice: Device): Promise<void> => {
       setConnectionState('connecting');
-      setStatusText(`Łączenie z ${scannedDevice.name ?? scannedDevice.id}…`);
+      setStatusText(`Łączenie z ${scannedDevice.localName ?? scannedDevice.name ?? scannedDevice.id}…`);
 
       let device = await scannedDevice.connect({
         autoConnect: false,
@@ -428,22 +479,19 @@ export default function App() {
     [installMonitor, manager],
   );
 
-  const startTest = useCallback(async () => {
-    if (
-      connectingRef.current ||
-      connectionState === 'receiving' ||
-      connectedDeviceIdRef.current !== null
-    ) {
+  const startScan = useCallback(async () => {
+    if (connectingRef.current || connectedDeviceIdRef.current !== null) {
       return;
     }
 
     intentionalDisconnectRef.current = false;
-    connectingRef.current = true;
-    scanMatchHandledRef.current = false;
     setErrorText(null);
     setConnectedInfo(null);
     removeSubscriptions();
     stopScan();
+    discoveredDeviceObjectsRef.current.clear();
+    discoveredRowsRef.current.clear();
+    setScanDevices([]);
 
     try {
       const permissionsGranted = await requestAndroidPermissions();
@@ -457,65 +505,80 @@ export default function App() {
 
       setConnectionState('scanning');
       setStatusText(
-        `Skanowanie LowLatency: name=${BLE_CONFIG.targetDeviceName}, id=${BLE_CONFIG.targetDeviceId}`,
+        `Skanowanie wszystkich urządzeń BLE przez ${BLE_CONFIG.scanTimeoutMs / 1000} s. Wybór urządzenia jest ręczny.`,
       );
 
+      scanUiTimerRef.current = setInterval(() => {
+        refreshScanList();
+      }, 300);
+
       scanTimeoutRef.current = setTimeout(() => {
-        stopScan();
-        connectingRef.current = false;
-        scanMatchHandledRef.current = false;
-        setConnectionState('error');
-        setErrorText(`Nie znaleziono modułu w ciągu ${BLE_CONFIG.scanTimeoutMs / 1000} s.`);
+        finishScan();
       }, BLE_CONFIG.scanTimeoutMs);
 
       await manager.startDeviceScan(
         null,
         {
           scanMode: ScanMode.LowLatency,
-          allowDuplicates: false,
-          legacyScan: true,
+          // Domyślny legacyScan=true jest celowo zachowany: Bolutek nadaje klasyczny advertisement.
+          // Brak filtra UUID/nazwy/MAC — pokazujemy wszystko, co zwróci Android.
         },
         (error, device) => {
           if (error !== null) {
             stopScan();
-            connectingRef.current = false;
-            scanMatchHandledRef.current = false;
             setConnectionState('error');
             setErrorText(ErrorDescription(error));
             return;
           }
 
-          if (
-            device === null ||
-            !deviceMatches(device) ||
-            scanMatchHandledRef.current
-          ) {
+          if (device === null) {
             return;
           }
 
-          // Android może zwrócić ten sam advertisement kilka razy zanim stopScan się zakończy.
-          scanMatchHandledRef.current = true;
-          stopScan();
-          void connectFoundDevice(device).catch((connectError: unknown) => {
-            const failedDeviceId = connectedDeviceIdRef.current;
-            if (failedDeviceId !== null) {
-              void manager.cancelDeviceConnection(failedDeviceId).catch(() => undefined);
-            }
-            connectedDeviceIdRef.current = null;
-            connectingRef.current = false;
-            scanMatchHandledRef.current = false;
-            setConnectionState('error');
-            setErrorText(ErrorDescription(connectError));
-          });
+          discoveredDeviceObjectsRef.current.set(device.id, device);
+          discoveredRowsRef.current.set(device.id, deviceToRow(device));
         },
       );
     } catch (error) {
-      connectingRef.current = false;
-      scanMatchHandledRef.current = false;
+      stopScan();
       setConnectionState('error');
       setErrorText(ErrorDescription(error));
     }
-  }, [connectFoundDevice, connectionState, manager, removeSubscriptions, stopScan]);
+  }, [finishScan, manager, refreshScanList, removeSubscriptions, stopScan]);
+
+  const connectSelectedDevice = useCallback(
+    async (deviceId: string) => {
+      if (connectingRef.current || connectedDeviceIdRef.current !== null) {
+        return;
+      }
+
+      const device = discoveredDeviceObjectsRef.current.get(deviceId);
+      if (device === undefined) {
+        setConnectionState('error');
+        setErrorText('Wybrane urządzenie nie jest już dostępne w pamięci skanera. Uruchom skan ponownie.');
+        return;
+      }
+
+      intentionalDisconnectRef.current = false;
+      connectingRef.current = true;
+      setErrorText(null);
+      stopScan();
+
+      try {
+        await connectFoundDevice(device);
+      } catch (connectError) {
+        const failedDeviceId = connectedDeviceIdRef.current;
+        if (failedDeviceId !== null) {
+          void manager.cancelDeviceConnection(failedDeviceId).catch(() => undefined);
+        }
+        connectedDeviceIdRef.current = null;
+        connectingRef.current = false;
+        setConnectionState('error');
+        setErrorText(ErrorDescription(connectError));
+      }
+    },
+    [connectFoundDevice, manager, stopScan],
+  );
 
   const disconnect = useCallback(async () => {
     intentionalDisconnectRef.current = true;
@@ -524,7 +587,6 @@ export default function App() {
     const deviceId = connectedDeviceIdRef.current;
     connectedDeviceIdRef.current = null;
     connectingRef.current = false;
-    scanMatchHandledRef.current = false;
     if (deviceId === null) {
       setConnectionState('disconnected');
       setStatusText('Brak aktywnego połączenia.');
@@ -538,7 +600,7 @@ export default function App() {
       // Połączenie mogło już zostać zamknięte przez system.
     }
     setConnectionState('disconnected');
-    setStatusText('Rozłączono ręcznie.');
+    setStatusText('Rozłączono ręcznie. Możesz ponownie uruchomić skan BLE.');
   }, [manager, removeSubscriptions, stopScan]);
 
   const resetStats = useCallback(() => {
@@ -548,7 +610,7 @@ export default function App() {
 
   const shareReport = useCallback(async () => {
     const report = [
-      'ECUMaster BLE RX Stats',
+      'ECUMaster BLE RX Stats v1.1',
       `generated=${new Date().toISOString()}`,
       `state=${connectionState}`,
       `status=${statusText}`,
@@ -631,11 +693,20 @@ export default function App() {
     };
   }, [manager, removeSubscriptions, stopScan]);
 
-  const isBusy = !['idle', 'disconnected', 'error'].includes(connectionState);
-  const activeConnectionNeedsDisconnect =
-    connectionState === 'error' && connectedInfo !== null;
-  const canDisconnect = isBusy || activeConnectionNeedsDisconnect;
-  const canStart = !isBusy && !activeConnectionNeedsDisconnect;
+  const isConnectionBusy = [
+    'waiting-for-bluetooth',
+    'connecting',
+    'discovering',
+    'subscribing',
+    'receiving',
+    'disconnecting',
+  ].includes(connectionState);
+  const activeConnectionNeedsDisconnect = connectionState === 'error' && connectedInfo !== null;
+  const canDisconnect = isConnectionBusy || activeConnectionNeedsDisconnect;
+  const canStartScan =
+    !isConnectionBusy && !activeConnectionNeedsDisconnect && connectionState !== 'scanning';
+  const canConnectFromList =
+    !connectingRef.current && connectedDeviceIdRef.current === null && connectionState !== 'receiving';
   const histogramText =
     stats.notificationLengthHistogram.length === 0
       ? '—'
@@ -646,17 +717,21 @@ export default function App() {
   return (
     <SafeAreaView style={styles.safeArea}>
       <ScrollView contentContainerStyle={styles.container}>
-        <Text style={styles.title}>ECUMaster BLE RX Stats</Text>
+        <Text style={styles.title}>ECUMaster BLE RX Stats v1.1</Text>
         <Text style={styles.subtitle}>
-          Minimalny test react-native-ble-plx: LowLatency scan, High connection priority, MTU request,
-          RX-only.
+          Najpierw skan wszystkich urządzeń BLE, potem ręczny wybór. Po połączeniu: High connection
+          priority, MTU request i test RX-only.
         </Text>
 
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>Połączenie</Text>
           <Text style={styles.status}>{connectionState}</Text>
           <Text>{statusText}</Text>
-          {isBusy && connectionState !== 'receiving' ? <ActivityIndicator style={styles.spinner} /> : null}
+          {['waiting-for-bluetooth', 'connecting', 'discovering', 'subscribing'].includes(
+            connectionState,
+          ) ? (
+            <ActivityIndicator style={styles.spinner} />
+          ) : null}
           {errorText !== null ? <Text style={styles.error}>{errorText}</Text> : null}
 
           {connectedInfo !== null ? (
@@ -672,30 +747,79 @@ export default function App() {
 
           <View style={styles.buttonRow}>
             <View style={styles.buttonCell}>
-              <Button title="Połącz i testuj" onPress={() => void startTest()} disabled={!canStart} />
+              <Button title="Skanuj BLE" onPress={() => void startScan()} disabled={!canStartScan} />
             </View>
             <View style={styles.buttonCell}>
-              <Button title="Rozłącz" onPress={() => void disconnect()} disabled={!canDisconnect} />
+              <Button
+                title="Zatrzymaj skan"
+                onPress={() => finishScan('Skan zatrzymany ręcznie. Wybierz urządzenie z listy.')}
+                disabled={connectionState !== 'scanning'}
+              />
             </View>
           </View>
           <View style={styles.buttonRow}>
             <View style={styles.buttonCell}>
-              <Button title="Reset statystyk" onPress={resetStats} />
+              <Button title="Rozłącz" onPress={() => void disconnect()} disabled={!canDisconnect} />
             </View>
             <View style={styles.buttonCell}>
-              <Button title="Udostępnij raport" onPress={() => void shareReport()} />
+              <Button title="Reset statystyk" onPress={resetStats} />
             </View>
           </View>
+          <View style={styles.singleButtonRow}>
+            <Button title="Udostępnij raport" onPress={() => void shareReport()} />
+          </View>
+        </View>
+
+        <View style={styles.card}>
+          <Text style={styles.sectionTitle}>Znalezione urządzenia BLE ({scanDevices.length})</Text>
+          <Text style={styles.note}>
+            Lista nie filtruje po nazwie, MAC ani UUID. RSSI jest z ostatniego advertisement zwróconego
+            przez Androida. Najsilniejsze urządzenia są na górze.
+          </Text>
+          {connectionState === 'scanning' ? <ActivityIndicator style={styles.spinner} /> : null}
+          {scanDevices.length === 0 ? (
+            <Text style={styles.note}>
+              {connectionState === 'scanning'
+                ? 'Czekam na advertisementy BLE…'
+                : 'Brak wyników. Kliknij „Skanuj BLE”.'}
+            </Text>
+          ) : (
+            scanDevices.map((device) => (
+              <View key={device.id} style={styles.deviceBox}>
+                <Text style={styles.deviceName}>{deviceDisplayName(device)}</Text>
+                {device.name !== null && device.localName !== null && device.name !== device.localName ? (
+                  <Text style={styles.mono}>name: {device.name}</Text>
+                ) : null}
+                <Text style={styles.mono}>id: {device.id}</Text>
+                <Text style={styles.mono}>
+                  RSSI: {device.rssi ?? '—'} dBm | connectable:{' '}
+                  {device.isConnectable === null ? '—' : device.isConnectable ? 'yes' : 'no'}
+                </Text>
+                <Text style={styles.mono}>
+                  advertised services:{' '}
+                  {device.serviceUUIDs === null || device.serviceUUIDs.length === 0
+                    ? '—'
+                    : device.serviceUUIDs.join(', ')}
+                </Text>
+                <View style={styles.deviceButton}>
+                  <Button
+                    title="Połącz z tym urządzeniem"
+                    onPress={() => void connectSelectedDevice(device.id)}
+                    disabled={!canConnectFromList}
+                  />
+                </View>
+              </View>
+            ))
+          )}
         </View>
 
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>Transport</Text>
           <Text style={styles.mono}>czas: {formatNumber(stats.elapsedSeconds, 1)} s</Text>
           <Text style={styles.mono}>
-            notifications: {stats.notifications} | avg {formatNumber(
-              stats.notificationsPerSecondAverage,
-              2,
-            )}/s | last 1s {stats.notificationsPerSecond1s}/s
+            notifications: {stats.notifications} | avg{' '}
+            {formatNumber(stats.notificationsPerSecondAverage, 2)}/s | last 1s{' '}
+            {stats.notificationsPerSecond1s}/s
           </Text>
           <Text style={styles.mono}>
             bytes: {stats.bytes} | avg {formatNumber(stats.bytesPerSecondAverage, 1)} B/s | last 1s{' '}
@@ -709,7 +833,9 @@ export default function App() {
           </Text>
           <Text style={styles.mono}>length histogram: {histogramText}</Text>
           <Text style={styles.mono}>active channel IDs: {stats.channelCounts.length}</Text>
-          <Text style={styles.mono}>notification gaps [ms]: {formatDistribution(stats.notificationGapMs)}</Text>
+          <Text style={styles.mono}>
+            notification gaps [ms]: {formatDistribution(stats.notificationGapMs)}
+          </Text>
         </View>
 
         <View style={styles.card}>
@@ -736,19 +862,26 @@ export default function App() {
 
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>Obciążenie aplikacji</Text>
-          <Text style={styles.mono}>BLE callback [ms]: {formatDistribution(stats.callbackDurationMs)}</Text>
-          <Text style={styles.mono}>JS event-loop lag [ms]: {formatDistribution(stats.jsEventLoopLagMs)}</Text>
+          <Text style={styles.mono}>
+            BLE callback [ms]: {formatDistribution(stats.callbackDurationMs)}
+          </Text>
+          <Text style={styles.mono}>
+            JS event-loop lag [ms]: {formatDistribution(stats.jsEventLoopLagMs)}
+          </Text>
           <Text style={styles.note}>
-            UI odświeża się tylko 2 razy/s. Callback BLE wyłącznie dekoduje Base64, aktualizuje liczniki i
-            wraca — brak setState, console.log, zapisu pliku i operacji TX dla każdej notyfikacji.
+            Po połączeniu skan jest zatrzymany. UI statystyk odświeża się tylko 2 razy/s. Callback BLE
+            wyłącznie dekoduje Base64, aktualizuje liczniki i wraca — brak setState, console.log, zapisu
+            pliku i operacji TX dla każdej notyfikacji.
           </Text>
         </View>
 
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>Założenia testu</Text>
-          <Text style={styles.mono}>target name: {BLE_CONFIG.targetDeviceName}</Text>
-          <Text style={styles.mono}>target id: {BLE_CONFIG.targetDeviceId}</Text>
+          <Text style={styles.mono}>scan filter: NONE</Text>
+          <Text style={styles.mono}>scan mode: LowLatency</Text>
+          <Text style={styles.mono}>device selection: manual</Text>
           <Text style={styles.mono}>requested MTU: {BLE_CONFIG.requestedMtu}</Text>
+          <Text style={styles.mono}>connection priority: HIGH</Text>
           <Text style={styles.mono}>
             expected: RPM {BLE_CONFIG.expectedRatesHz.rpm} Hz, IAT/CLT{' '}
             {BLE_CONFIG.expectedRatesHz.clt} Hz
@@ -815,6 +948,9 @@ const styles = StyleSheet.create({
   buttonCell: {
     flex: 1,
   },
+  singleButtonRow: {
+    marginTop: 6,
+  },
   mono: {
     fontFamily: Platform.select({ android: 'monospace', default: 'Courier' }),
     fontSize: 12,
@@ -830,6 +966,21 @@ const styles = StyleSheet.create({
   channelTitle: {
     fontWeight: '700',
     marginBottom: 2,
+  },
+  deviceBox: {
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: '#c7c7c7',
+    borderRadius: 8,
+    padding: 10,
+    marginTop: 6,
+    gap: 2,
+  },
+  deviceName: {
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  deviceButton: {
+    marginTop: 6,
   },
   note: {
     marginTop: 4,
