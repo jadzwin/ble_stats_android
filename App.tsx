@@ -281,6 +281,24 @@ async function requestAndroidPermissions(): Promise<boolean> {
   return result === PermissionsAndroid.RESULTS.GRANTED;
 }
 
+async function requestAndroidSppPermissions(): Promise<boolean> {
+  if (Platform.OS !== 'android') {
+    return true;
+  }
+
+  const apiLevel = Number(Platform.Version);
+  if (apiLevel >= 31) {
+    const result = await PermissionsAndroid.request(
+      PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+    );
+    return result === PermissionsAndroid.RESULTS.GRANTED;
+  }
+
+  // Dla Android <= 11, gdy korzystamy wyłącznie z już sparowanych urządzeń
+  // i nie uruchamiamy discovery, BLUETOOTH jest uprawnieniem install-time.
+  return true;
+}
+
 async function waitForBlePoweredOn(manager: BleManager): Promise<void> {
   const initialState = await manager.state();
   if (initialState === State.PoweredOn) {
@@ -471,6 +489,7 @@ export default function App() {
   const bleScanTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const bleScanUiTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const classicScanGenerationRef = useRef(0);
+  const classicDiscoveryActiveRef = useRef(false);
 
   const discoveredBleObjectsRef = useRef<Map<string, Device>>(new Map());
   const discoveredBleRowsRef = useRef<Map<string, BleScanDeviceRow>>(new Map());
@@ -544,11 +563,12 @@ export default function App() {
     if (invalidate) {
       classicScanGenerationRef.current += 1;
     }
-    try {
-      await ClassicBluetooth.cancelDiscovery();
-    } catch {
-      // Brak aktywnego discovery nie jest błędem.
-    }
+
+    // v1.4 celowo NIE wywołuje natywnego BluetoothAdapter.cancelDiscovery().
+    // Do testu SPP wystarczają urządzenia już sparowane w ustawieniach Androida.
+    // Dzięki temu ścieżka BLE nigdy nie dotyka modułu Bluetooth Classic, a SPP
+    // nie uruchamia kosztownego inquiry scan ani nie ryzykuje SecurityException.
+    classicDiscoveryActiveRef.current = false;
   }, []);
 
   const stopAllScans = useCallback(() => {
@@ -781,7 +801,10 @@ export default function App() {
     setErrorText(null);
     setConnectedInfo(null);
     removeSubscriptions();
-    stopAllScans();
+    // BLE nie powinno wywoływać żadnej funkcji z modułu Bluetooth Classic.
+    // W v1.3 stopAllScans() wykonywało cancelDiscovery() Classic jeszcze przed
+    // uzyskaniem BLUETOOTH_SCAN, co mogło powodować natywny crash na Android 12+.
+    stopBleScan();
     discoveredBleObjectsRef.current.clear();
     discoveredBleRowsRef.current.clear();
     setBleScanDevices([]);
@@ -826,7 +849,7 @@ export default function App() {
       setConnectionState('error');
       setErrorText(errorDescription(error));
     }
-  }, [finishBleScan, manager, refreshBleScanList, removeSubscriptions, stopAllScans, stopBleScan]);
+  }, [finishBleScan, manager, refreshBleScanList, removeSubscriptions, stopBleScan]);
 
   const startSppScan = useCallback(async () => {
     if (connectingRef.current || connectedTransportRef.current !== null) {
@@ -837,49 +860,40 @@ export default function App() {
     setErrorText(null);
     setConnectedInfo(null);
     removeSubscriptions();
-    stopAllScans();
+    stopBleScan();
     discoveredSppObjectsRef.current.clear();
     discoveredSppRowsRef.current.clear();
     setSppScanDevices([]);
 
-    const generation = classicScanGenerationRef.current + 1;
-    classicScanGenerationRef.current = generation;
+    classicScanGenerationRef.current += 1;
 
     try {
-      const permissionsGranted = await requestAndroidPermissions();
+      const permissionsGranted = await requestAndroidSppPermissions();
       if (!permissionsGranted) {
-        throw new Error('Brak uprawnień Bluetooth wymaganych do skanowania i połączenia SPP.');
+        throw new Error(
+          'Brak uprawnienia Urządzenia w pobliżu / BLUETOOTH_CONNECT wymaganego dla SPP.',
+        );
       }
 
       setConnectionState('waiting-for-bluetooth');
       setStatusText('Sprawdzanie Bluetooth Classic…');
       await ensureClassicBluetoothReady();
 
+      // Dla testu performance nie potrzebujemy inquiry scan. Android zaleca
+      // najpierw sprawdzić urządzenia sparowane; do połączenia wystarcza MAC.
+      // Bolutek należy wcześniej sparować w Ustawienia -> Bluetooth.
       const bonded = await ClassicBluetooth.getBondedDevices();
       mergeSppDevices(bonded, true);
 
-      setConnectionState('scanning');
-      setStatusText(
-        `SPP: pokazano ${bonded.length} sparowanych urządzeń. Trwa discovery urządzeń Classic/DUAL…`,
-      );
-
-      const discovered = await ClassicBluetooth.startDiscovery();
-      if (classicScanGenerationRef.current !== generation) {
-        return;
-      }
-      mergeSppDevices(discovered, false);
       setConnectionState('scan-results');
       setStatusText(
-        'Skan SPP zakończony. Sparowane urządzenia są na górze; niesparowane można sparować przy połączeniu.',
+        `SPP: znaleziono ${bonded.length} sparowanych urządzeń. Jeśli modułu nie ma na liście, sparuj go najpierw w ustawieniach Androida.`,
       );
     } catch (error) {
-      if (classicScanGenerationRef.current !== generation) {
-        return;
-      }
       setConnectionState('error');
       setErrorText(errorDescription(error));
     }
-  }, [mergeSppDevices, removeSubscriptions, stopAllScans]);
+  }, [mergeSppDevices, removeSubscriptions, stopBleScan]);
 
   const connectSelectedBleDevice = useCallback(
     async (deviceId: string) => {
@@ -1131,7 +1145,14 @@ export default function App() {
       if (nextTransport === transportMode || connectedTransportRef.current !== null) {
         return;
       }
-      stopAllScans();
+      // Zatrzymuj wyłącznie skan aktualnie wybranego transportu. Dzięki temu
+      // samo przełączenie BLE <-> SPP nie dotyka natywnego modułu Classic bez
+      // potrzeby i bez uprawnień.
+      if (transportMode === 'ble') {
+        stopBleScan();
+      } else {
+        void cancelSppDiscovery(true);
+      }
       removeSubscriptions();
       connectingRef.current = false;
       setTransportMode(nextTransport);
@@ -1142,10 +1163,10 @@ export default function App() {
       setStatusText(
         nextTransport === 'ble'
           ? 'Wybrano BLE/GATT. Kliknij „Skanuj BLE”.'
-          : 'Wybrano SPP/Classic. Sparowane urządzenia pojawią się od razu po rozpoczęciu skanu.',
+          : 'Wybrano SPP/Classic. Najpierw sparuj moduł w ustawieniach Androida, potem pokaż sparowane urządzenia.',
       );
     },
-    [removeSubscriptions, resetStats, stopAllScans, transportMode],
+    [cancelSppDiscovery, removeSubscriptions, resetStats, stopBleScan, transportMode],
   );
 
   const startSelectedScan = useCallback(async () => {
@@ -1194,7 +1215,7 @@ export default function App() {
 
     const eventName = transportMode === 'ble' ? 'notifications' : 'read_callbacks';
     const report = [
-      'ECUMaster BT RX Stats v1.3',
+      'ECUMaster BT RX Stats v1.4',
       `generated=${new Date().toISOString()}`,
       `state=${connectionState}`,
       `status=${statusText}`,
@@ -1319,9 +1340,9 @@ export default function App() {
     <SafeAreaView style={styles.safeArea}>
       <StatusBar barStyle="dark-content" backgroundColor="#f2f3f5" />
       <ScrollView contentContainerStyle={styles.container}>
-        <Text style={styles.title}>ECUMaster BT RX Stats v1.3</Text>
+        <Text style={styles.title}>ECUMaster BT RX Stats v1.4</Text>
         <Text style={styles.subtitle}>
-          Minimalny miernik RX dla BLE/GATT i SPP/RFCOMM. Ten sam parser i te same statystyki dla obu transportów.
+          Minimalny miernik RX dla BLE/GATT i SPP/RFCOMM. SPP korzysta wyłącznie z urządzeń wcześniej sparowanych w Androidzie.
         </Text>
 
         <View style={styles.card}>
@@ -1412,7 +1433,7 @@ export default function App() {
           <View style={styles.buttonRow}>
             <View style={styles.buttonCell}>
               <Button
-                title={transportMode === 'ble' ? 'Skanuj BLE' : 'Skanuj SPP'}
+                title={transportMode === 'ble' ? 'Skanuj BLE' : 'Pokaż sparowane SPP'}
                 onPress={() => void startSelectedScan()}
                 disabled={!canStartScan}
               />
@@ -1451,7 +1472,7 @@ export default function App() {
             </Text>
           ) : (
             <Text style={styles.note}>
-              Urządzenia sparowane pojawiają się od razu na górze. Pełne discovery Bluetooth Classic może trwać kilkanaście sekund.
+              SPP korzysta z urządzeń już sparowanych. Jeśli modułu nie ma na liście, sparuj go najpierw w Ustawieniach Androida → Bluetooth.
             </Text>
           )}
 
@@ -1497,8 +1518,8 @@ export default function App() {
           ) : sppScanDevices.length === 0 ? (
             <Text style={styles.note}>
               {connectionState === 'scanning'
-                ? 'Czekam na wynik discovery SPP…'
-                : 'Brak wyników. Najlepiej najpierw sparuj moduł w ustawieniach Androida, potem kliknij „Skanuj SPP”.'}
+                ? 'Odczytuję listę sparowanych urządzeń…'
+                : 'Brak wyników. Sparuj moduł w ustawieniach Androida, potem kliknij „Pokaż sparowane SPP”.'}
             </Text>
           ) : (
             sppScanDevices.map((device) => (
@@ -1599,6 +1620,7 @@ export default function App() {
           ) : (
             <>
               <Text style={styles.mono}>transport: Bluetooth Classic SPP/RFCOMM</Text>
+              <Text style={styles.mono}>device discovery: bonded devices only</Text>
               <Text style={styles.mono}>connection type: binary</Text>
               <Text style={styles.mono}>READ_SIZE: {SPP_READ_SIZE}</Text>
               <Text style={styles.mono}>READ_TIMEOUT: 0</Text>
