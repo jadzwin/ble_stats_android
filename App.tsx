@@ -4,10 +4,11 @@ import {
   Button,
   PermissionsAndroid,
   Platform,
+  Pressable,
   SafeAreaView,
   ScrollView,
-  StatusBar,
   Share,
+  StatusBar,
   StyleSheet,
   Text,
   View,
@@ -22,6 +23,7 @@ import {
   State,
 } from 'react-native-ble-plx';
 import type { Characteristic, Device, Subscription } from 'react-native-ble-plx';
+import RNBluetoothClassic from 'react-native-bluetooth-classic';
 
 import { BleStatsCollector } from './src/BleStatsCollector';
 import type {
@@ -32,11 +34,16 @@ import type {
 import { BLE_CONFIG } from './src/config';
 import { monotonicNowMs } from './src/time';
 
+type TransportMode = 'ble' | 'spp';
+type ClassicDeviceType = 'CLASSIC' | 'LOW_ENERGY' | 'DUAL' | 'UNKNOWN';
+type ClassicRxEncoding = 'unknown' | 'base64' | 'binary-string';
+
 type ConnectionState =
   | 'idle'
   | 'waiting-for-bluetooth'
   | 'scanning'
   | 'scan-results'
+  | 'pairing'
   | 'connecting'
   | 'discovering'
   | 'subscribing'
@@ -45,7 +52,60 @@ type ConnectionState =
   | 'disconnected'
   | 'error';
 
-interface ConnectedInfo {
+interface RemovableSubscription {
+  remove(): void;
+}
+
+interface ClassicNativeDeviceLike {
+  address?: string;
+  id?: string;
+  name?: string;
+}
+
+interface ClassicReadEventLike {
+  data: string;
+  device?: ClassicNativeDeviceLike;
+}
+
+interface ClassicDeviceEventLike {
+  device?: ClassicNativeDeviceLike;
+  message?: string;
+  error?: unknown;
+}
+
+interface ClassicDeviceLike {
+  name?: string;
+  address?: string;
+  id?: string;
+  bonded?: boolean | Boolean;
+  deviceClass?: string | Record<string, unknown>;
+  rssi?: number | Number;
+  type?: string;
+  extra?: unknown;
+  connect(options?: Record<string, unknown>): Promise<boolean>;
+  isConnected(): Promise<boolean>;
+  disconnect(): Promise<boolean>;
+  onDataReceived(listener: (event: ClassicReadEventLike) => void): RemovableSubscription;
+}
+
+interface ClassicModuleLike {
+  isBluetoothAvailable(): Promise<boolean>;
+  isBluetoothEnabled(): Promise<boolean>;
+  requestBluetoothEnabled(): Promise<boolean>;
+  getBondedDevices(): Promise<ClassicDeviceLike[]>;
+  startDiscovery(): Promise<ClassicDeviceLike[]>;
+  cancelDiscovery(): Promise<boolean>;
+  pairDevice(address: string): Promise<ClassicDeviceLike>;
+  onDeviceDisconnected(
+    listener: (event: ClassicDeviceEventLike) => void,
+  ): RemovableSubscription;
+  onError(listener: (event: ClassicDeviceEventLike) => void): RemovableSubscription;
+}
+
+const ClassicBluetooth = RNBluetoothClassic as unknown as ClassicModuleLike;
+
+interface BleConnectedInfo {
+  transport: 'ble';
   id: string;
   name: string;
   scanRssi: number | null;
@@ -56,7 +116,22 @@ interface ConnectedInfo {
   connectedAtIso: string;
 }
 
-interface ScanDeviceRow {
+interface SppConnectedInfo {
+  transport: 'spp';
+  id: string;
+  address: string;
+  name: string;
+  bonded: boolean;
+  deviceType: ClassicDeviceType;
+  scanRssi: number | null;
+  secureSocket: boolean;
+  readSize: number;
+  connectedAtIso: string;
+}
+
+type ConnectedInfo = BleConnectedInfo | SppConnectedInfo;
+
+interface BleScanDeviceRow {
   id: string;
   name: string | null;
   localName: string | null;
@@ -65,15 +140,28 @@ interface ScanDeviceRow {
   serviceUUIDs: string[] | null;
 }
 
+interface SppScanDeviceRow {
+  id: string;
+  address: string;
+  name: string;
+  bonded: boolean;
+  type: ClassicDeviceType;
+  rssi: number | null;
+}
+
+const SPP_READ_SIZE = 8192;
+
 function normalizedUuid(uuid: string): string {
   return uuid.trim().toLowerCase();
 }
 
-function deviceDisplayName(device: Pick<ScanDeviceRow, 'id' | 'name' | 'localName'>): string {
+function bleDeviceDisplayName(
+  device: Pick<BleScanDeviceRow, 'id' | 'name' | 'localName'>,
+): string {
   return device.localName ?? device.name ?? '(bez nazwy)';
 }
 
-function deviceToRow(device: Device): ScanDeviceRow {
+function bleDeviceToRow(device: Device): BleScanDeviceRow {
   return {
     id: device.id,
     name: device.name ?? null,
@@ -84,14 +172,87 @@ function deviceToRow(device: Device): ScanDeviceRow {
   };
 }
 
-function sortDevices(rows: ScanDeviceRow[]): ScanDeviceRow[] {
+function sortBleDevices(rows: BleScanDeviceRow[]): BleScanDeviceRow[] {
   return rows.sort((a, b) => {
     const aRssi = a.rssi ?? -999;
     const bRssi = b.rssi ?? -999;
     if (aRssi !== bRssi) {
       return bRssi - aRssi;
     }
-    return deviceDisplayName(a).localeCompare(deviceDisplayName(b));
+    return bleDeviceDisplayName(a).localeCompare(bleDeviceDisplayName(b));
+  });
+}
+
+function finiteNumber(value: unknown): number | null {
+  const converted = Number(value);
+  return Number.isFinite(converted) ? converted : null;
+}
+
+function classicAddress(device: ClassicDeviceLike): string {
+  return device.address ?? device.id ?? '';
+}
+
+function classicDeviceName(device: ClassicDeviceLike): string {
+  const name = device.name?.trim();
+  return name && name.length > 0 ? name : '(bez nazwy)';
+}
+
+function classicDeviceType(device: ClassicDeviceLike): ClassicDeviceType {
+  const value = String(device.type ?? 'UNKNOWN').toUpperCase();
+  if (value === 'CLASSIC' || value === 'LOW_ENERGY' || value === 'DUAL') {
+    return value;
+  }
+  return 'UNKNOWN';
+}
+
+function classicDeviceRssi(device: ClassicDeviceLike): number | null {
+  const direct = finiteNumber(device.rssi);
+  if (direct !== null && direct !== 0) {
+    return direct;
+  }
+
+  const extra = device.extra;
+  if (extra instanceof Map) {
+    const mapped = finiteNumber(extra.get('rssi'));
+    return mapped === 0 ? null : mapped;
+  }
+  if (typeof extra === 'object' && extra !== null && 'rssi' in extra) {
+    const mapped = finiteNumber((extra as { rssi?: unknown }).rssi);
+    return mapped === 0 ? null : mapped;
+  }
+  return null;
+}
+
+function classicDeviceToRow(device: ClassicDeviceLike): SppScanDeviceRow | null {
+  const address = classicAddress(device);
+  if (address.length === 0) {
+    return null;
+  }
+  const type = classicDeviceType(device);
+  if (type === 'LOW_ENERGY') {
+    return null;
+  }
+  return {
+    id: device.id ?? address,
+    address,
+    name: classicDeviceName(device),
+    bonded: Boolean(device.bonded),
+    type,
+    rssi: classicDeviceRssi(device),
+  };
+}
+
+function sortSppDevices(rows: SppScanDeviceRow[]): SppScanDeviceRow[] {
+  return rows.sort((a, b) => {
+    if (a.bonded !== b.bonded) {
+      return a.bonded ? -1 : 1;
+    }
+    const aRssi = a.rssi ?? -999;
+    const bRssi = b.rssi ?? -999;
+    if (aRssi !== bRssi) {
+      return bRssi - aRssi;
+    }
+    return a.name.localeCompare(b.name);
   });
 }
 
@@ -120,7 +281,7 @@ async function requestAndroidPermissions(): Promise<boolean> {
   return result === PermissionsAndroid.RESULTS.GRANTED;
 }
 
-async function waitForPoweredOn(manager: BleManager): Promise<void> {
+async function waitForBlePoweredOn(manager: BleManager): Promise<void> {
   const initialState = await manager.state();
   if (initialState === State.PoweredOn) {
     return;
@@ -158,6 +319,21 @@ async function waitForPoweredOn(manager: BleManager): Promise<void> {
       }
     }, true);
   });
+}
+
+async function ensureClassicBluetoothReady(): Promise<void> {
+  if (Platform.OS !== 'android') {
+    throw new Error('Test SPP w tej aplikacji jest przeznaczony dla Androida.');
+  }
+  if (!(await ClassicBluetooth.isBluetoothAvailable())) {
+    throw new Error('Telefon nie zgłasza obsługi Bluetooth Classic.');
+  }
+  if (!(await ClassicBluetooth.isBluetoothEnabled())) {
+    const enabled = await ClassicBluetooth.requestBluetoothEnabled();
+    if (!enabled) {
+      throw new Error('Bluetooth nie został włączony.');
+    }
+  }
 }
 
 function formatNumber(value: number | null, digits = 1): string {
@@ -221,7 +397,7 @@ function emptySnapshot(): BleStatsSnapshot {
   };
 }
 
-function ErrorDescription(error: unknown): string {
+function errorDescription(error: unknown): string {
   if (error instanceof BleError) {
     return [
       error.message,
@@ -236,7 +412,31 @@ function ErrorDescription(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
   }
+  if (typeof error === 'object' && error !== null && 'message' in error) {
+    return String((error as { message?: unknown }).message);
+  }
   return String(error);
+}
+
+function decodeClassicPayload(data: string): {
+  payload: Uint8Array;
+  encoding: Exclude<ClassicRxEncoding, 'unknown'>;
+} {
+  const compact = data.replace(/\s+/g, '');
+  if (/^[A-Za-z0-9+/]*={0,2}$/.test(compact)) {
+    try {
+      const padded = compact + '='.repeat((4 - (compact.length % 4)) % 4);
+      return { payload: toByteArray(padded), encoding: 'base64' };
+    } catch {
+      // Fallback poniżej dla implementacji zwracającej bezpośredni string binarny.
+    }
+  }
+
+  const payload = new Uint8Array(data.length);
+  for (let index = 0; index < data.length; index += 1) {
+    payload[index] = data.charCodeAt(index) & 0xff;
+  }
+  return { payload, encoding: 'binary-string' };
 }
 
 function ChannelRow({ label, value }: { label: string; value: ChannelStatsSnapshot }) {
@@ -246,13 +446,11 @@ function ChannelRow({ label, value }: { label: string; value: ChannelStatsSnapsh
         {label} (ID {value.id})
       </Text>
       <Text style={styles.mono}>
-        count={value.count} | avg={formatNumber(value.averageRateHz, 2)} Hz | 5s={formatNumber(
-          value.recentRateHz,
-          2,
-        )} Hz
+        count={value.count} | avg={formatNumber(value.averageRateHz, 2)} Hz | 5s=
+        {formatNumber(value.recentRateHz, 2)} Hz
       </Text>
       <Text style={styles.mono}>
-        expected={formatNumber(value.expectedRateHz, 2)} Hz | delivery≈
+        expected={formatNumber(value.expectedRateHz, 2)} Hz | rate vs nominal≈
         {formatNumber(value.estimatedDeliveryPercent, 1)}% | raw={value.latestRaw ?? '—'} | age=
         {formatNumber(value.lastSeenAgoMs, 0)} ms
       </Text>
@@ -263,71 +461,158 @@ function ChannelRow({ label, value }: { label: string; value: ChannelStatsSnapsh
 export default function App() {
   const manager = useMemo(() => new BleManager(), []);
   const collectorRef = useRef(new BleStatsCollector());
-  const monitorSubscriptionRef = useRef<Subscription | null>(null);
-  const disconnectSubscriptionRef = useRef<Subscription | null>(null);
-  const scanTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const scanUiTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const discoveredDeviceObjectsRef = useRef<Map<string, Device>>(new Map());
-  const discoveredRowsRef = useRef<Map<string, ScanDeviceRow>>(new Map());
-  const connectingRef = useRef(false);
-  const connectedDeviceIdRef = useRef<string | null>(null);
-  const intentionalDisconnectRef = useRef(false);
 
+  const bleMonitorSubscriptionRef = useRef<Subscription | null>(null);
+  const bleDisconnectSubscriptionRef = useRef<Subscription | null>(null);
+  const classicDataSubscriptionRef = useRef<RemovableSubscription | null>(null);
+  const classicDisconnectSubscriptionRef = useRef<RemovableSubscription | null>(null);
+  const classicErrorSubscriptionRef = useRef<RemovableSubscription | null>(null);
+
+  const bleScanTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const bleScanUiTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const classicScanGenerationRef = useRef(0);
+
+  const discoveredBleObjectsRef = useRef<Map<string, Device>>(new Map());
+  const discoveredBleRowsRef = useRef<Map<string, BleScanDeviceRow>>(new Map());
+  const discoveredSppObjectsRef = useRef<Map<string, ClassicDeviceLike>>(new Map());
+  const discoveredSppRowsRef = useRef<Map<string, SppScanDeviceRow>>(new Map());
+
+  const connectingRef = useRef(false);
+  const connectedTransportRef = useRef<TransportMode | null>(null);
+  const connectedBleDeviceIdRef = useRef<string | null>(null);
+  const connectedSppDeviceRef = useRef<ClassicDeviceLike | null>(null);
+  const intentionalDisconnectRef = useRef(false);
+  const transportDecodeErrorsRef = useRef(0);
+  const classicRxEncodingRef = useRef<ClassicRxEncoding>('unknown');
+
+  const [transportMode, setTransportMode] = useState<TransportMode>('ble');
   const [connectionState, setConnectionState] = useState<ConnectionState>('idle');
   const [statusText, setStatusText] = useState(
-    'Gotowy. Najpierw zeskanuj BLE, wybierz urządzenie z listy i kliknij Połącz.',
+    'Wybierz BLE albo SPP, zeskanuj urządzenia i połącz się z wybranym modułem.',
   );
   const [errorText, setErrorText] = useState<string | null>(null);
   const [connectedInfo, setConnectedInfo] = useState<ConnectedInfo | null>(null);
-  const [scanDevices, setScanDevices] = useState<ScanDeviceRow[]>([]);
+  const [bleScanDevices, setBleScanDevices] = useState<BleScanDeviceRow[]>([]);
+  const [sppScanDevices, setSppScanDevices] = useState<SppScanDeviceRow[]>([]);
   const [stats, setStats] = useState<BleStatsSnapshot>(() => emptySnapshot());
+  const [transportDecodeErrors, setTransportDecodeErrors] = useState(0);
+  const [classicRxEncoding, setClassicRxEncoding] = useState<ClassicRxEncoding>('unknown');
 
-  const refreshScanList = useCallback(() => {
-    setScanDevices(sortDevices(Array.from(discoveredRowsRef.current.values())));
+  const refreshBleScanList = useCallback(() => {
+    setBleScanDevices(sortBleDevices(Array.from(discoveredBleRowsRef.current.values())));
   }, []);
 
-  const stopScan = useCallback(() => {
-    if (scanTimeoutRef.current !== null) {
-      clearTimeout(scanTimeoutRef.current);
-      scanTimeoutRef.current = null;
+  const refreshSppScanList = useCallback(() => {
+    setSppScanDevices(sortSppDevices(Array.from(discoveredSppRowsRef.current.values())));
+  }, []);
+
+  const mergeSppDevices = useCallback(
+    (devices: ClassicDeviceLike[], forceBonded = false) => {
+      for (const device of devices) {
+        const row = classicDeviceToRow(device);
+        if (row === null) {
+          continue;
+        }
+        const previous = discoveredSppRowsRef.current.get(row.address);
+        const merged: SppScanDeviceRow = {
+          ...row,
+          bonded: forceBonded || row.bonded || previous?.bonded === true,
+          rssi: row.rssi ?? previous?.rssi ?? null,
+          name: row.name === '(bez nazwy)' ? previous?.name ?? row.name : row.name,
+        };
+        discoveredSppObjectsRef.current.set(row.address, device);
+        discoveredSppRowsRef.current.set(row.address, merged);
+      }
+      refreshSppScanList();
+    },
+    [refreshSppScanList],
+  );
+
+  const stopBleScan = useCallback(() => {
+    if (bleScanTimeoutRef.current !== null) {
+      clearTimeout(bleScanTimeoutRef.current);
+      bleScanTimeoutRef.current = null;
     }
-    if (scanUiTimerRef.current !== null) {
-      clearInterval(scanUiTimerRef.current);
-      scanUiTimerRef.current = null;
+    if (bleScanUiTimerRef.current !== null) {
+      clearInterval(bleScanUiTimerRef.current);
+      bleScanUiTimerRef.current = null;
     }
     void manager.stopDeviceScan().catch(() => undefined);
   }, [manager]);
 
-  const finishScan = useCallback(
+  const cancelSppDiscovery = useCallback(async (invalidate = true): Promise<void> => {
+    if (invalidate) {
+      classicScanGenerationRef.current += 1;
+    }
+    try {
+      await ClassicBluetooth.cancelDiscovery();
+    } catch {
+      // Brak aktywnego discovery nie jest błędem.
+    }
+  }, []);
+
+  const stopAllScans = useCallback(() => {
+    stopBleScan();
+    void cancelSppDiscovery(true);
+  }, [cancelSppDiscovery, stopBleScan]);
+
+  const finishBleScan = useCallback(
     (message?: string) => {
-      stopScan();
-      refreshScanList();
+      stopBleScan();
+      refreshBleScanList();
       setConnectionState('scan-results');
       setStatusText(
         message ??
-          `Skan zakończony. Znaleziono ${discoveredRowsRef.current.size} urządzeń. Wybierz urządzenie i kliknij Połącz.`,
+          `Skan BLE zakończony. Znaleziono ${discoveredBleRowsRef.current.size} urządzeń.`,
       );
     },
-    [refreshScanList, stopScan],
+    [refreshBleScanList, stopBleScan],
+  );
+
+  const finishSppScan = useCallback(
+    (message?: string) => {
+      void cancelSppDiscovery(true);
+      refreshSppScanList();
+      setConnectionState('scan-results');
+      setStatusText(
+        message ??
+          `Skan SPP zakończony. Na liście jest ${discoveredSppRowsRef.current.size} urządzeń Classic/DUAL.`,
+      );
+    },
+    [cancelSppDiscovery, refreshSppScanList],
   );
 
   const removeSubscriptions = useCallback(() => {
-    monitorSubscriptionRef.current?.remove();
-    monitorSubscriptionRef.current = null;
-    disconnectSubscriptionRef.current?.remove();
-    disconnectSubscriptionRef.current = null;
+    bleMonitorSubscriptionRef.current?.remove();
+    bleMonitorSubscriptionRef.current = null;
+    bleDisconnectSubscriptionRef.current?.remove();
+    bleDisconnectSubscriptionRef.current = null;
+    classicDataSubscriptionRef.current?.remove();
+    classicDataSubscriptionRef.current = null;
+    classicDisconnectSubscriptionRef.current?.remove();
+    classicDisconnectSubscriptionRef.current = null;
+    classicErrorSubscriptionRef.current?.remove();
+    classicErrorSubscriptionRef.current = null;
   }, []);
 
-  const installMonitor = useCallback(
+  const resetStats = useCallback(() => {
+    collectorRef.current.reset(monotonicNowMs());
+    transportDecodeErrorsRef.current = 0;
+    classicRxEncodingRef.current = 'unknown';
+    setTransportDecodeErrors(0);
+    setClassicRxEncoding('unknown');
+    setStats(emptySnapshot());
+  }, []);
+
+  const installBleMonitor = useCallback(
     async (device: Device, scanRssi: number | null): Promise<void> => {
       setConnectionState('discovering');
-      setStatusText('Wykrywanie usług i charakterystyk…');
+      setStatusText('Wykrywanie usług i charakterystyk BLE…');
       const preparedDevice = await device.discoverAllServicesAndCharacteristics();
 
       const services = await preparedDevice.services();
       const preferredService = normalizedUuid(BLE_CONFIG.preferredServiceUuid);
       const preferredNotify = normalizedUuid(BLE_CONFIG.preferredNotifyCharacteristicUuid);
-
       const orderedServices = [...services].sort((a, b) => {
         const aPreferred = normalizedUuid(a.uuid) === preferredService ? 0 : 1;
         const bPreferred = normalizedUuid(b.uuid) === preferredService ? 0 : 1;
@@ -373,11 +658,10 @@ export default function App() {
 
       setConnectionState('subscribing');
       setStatusText(`Subskrypcja ${notifyCharacteristic.serviceUUID}/${notifyCharacteristic.uuid}…`);
-      collectorRef.current.reset(monotonicNowMs());
-      setStats(emptySnapshot());
+      resetStats();
 
-      const connectedAtIso = new Date().toISOString();
       setConnectedInfo({
+        transport: 'ble',
         id: preparedDevice.id,
         name: preparedDevice.localName ?? preparedDevice.name ?? '(bez nazwy)',
         scanRssi,
@@ -385,71 +669,79 @@ export default function App() {
         serviceUuid: notifyCharacteristic.serviceUUID,
         notifyCharacteristicUuid: notifyCharacteristic.uuid,
         characteristicSummary: characteristicDescriptions.join('\n'),
-        connectedAtIso,
+        connectedAtIso: new Date().toISOString(),
       });
 
-      monitorSubscriptionRef.current = preparedDevice.monitorCharacteristicForService(
+      bleMonitorSubscriptionRef.current = preparedDevice.monitorCharacteristicForService(
         notifyCharacteristic.serviceUUID,
         notifyCharacteristic.uuid,
         (error, characteristic) => {
           const callbackStartedAt = monotonicNowMs();
-          if (error !== null) {
-            if (!intentionalDisconnectRef.current) {
-              setErrorText(ErrorDescription(error));
-              setConnectionState('error');
+          try {
+            if (error !== null) {
+              if (!intentionalDisconnectRef.current) {
+                setErrorText(errorDescription(error));
+                setConnectionState('error');
+              }
+              return;
             }
-            return;
-          }
 
-          const base64Value = characteristic?.value;
-          if (base64Value === null || base64Value === undefined) {
-            return;
-          }
+            const base64Value = characteristic?.value;
+            if (base64Value === null || base64Value === undefined) {
+              return;
+            }
 
-          const payload = toByteArray(base64Value);
-          collectorRef.current.ingestNotification(payload, callbackStartedAt);
-          collectorRef.current.recordCallbackDuration(monotonicNowMs() - callbackStartedAt);
+            const payload = toByteArray(base64Value);
+            collectorRef.current.ingestNotification(payload, callbackStartedAt);
+          } catch {
+            transportDecodeErrorsRef.current += 1;
+          } finally {
+            collectorRef.current.recordCallbackDuration(monotonicNowMs() - callbackStartedAt);
+          }
         },
         'ecumaster-rx-monitor',
       );
 
-      disconnectSubscriptionRef.current = manager.onDeviceDisconnected(
+      bleDisconnectSubscriptionRef.current = manager.onDeviceDisconnected(
         preparedDevice.id,
         (error) => {
-          connectedDeviceIdRef.current = null;
+          connectedBleDeviceIdRef.current = null;
+          connectedTransportRef.current = null;
           connectingRef.current = false;
-          monitorSubscriptionRef.current?.remove();
-          monitorSubscriptionRef.current = null;
-          if (intentionalDisconnectRef.current) {
-            setConnectionState('disconnected');
-            setStatusText('Rozłączono ręcznie. Możesz ponownie uruchomić skan BLE.');
-            return;
-          }
+          bleMonitorSubscriptionRef.current?.remove();
+          bleMonitorSubscriptionRef.current = null;
           setConnectionState('disconnected');
-          setStatusText('Połączenie zostało przerwane.');
-          if (error !== null) {
-            setErrorText(ErrorDescription(error));
+          setStatusText(
+            intentionalDisconnectRef.current
+              ? 'Rozłączono BLE ręcznie.'
+              : 'Połączenie BLE zostało przerwane.',
+          );
+          if (!intentionalDisconnectRef.current && error !== null) {
+            setErrorText(errorDescription(error));
           }
         },
       );
 
+      connectedTransportRef.current = 'ble';
       connectingRef.current = false;
       setConnectionState('receiving');
-      setStatusText('Odbieranie notyfikacji. Brak logowania per ramka i brak operacji TX.');
+      setStatusText('BLE: odbieranie notyfikacji. Brak logowania per ramka i brak operacji TX.');
     },
-    [manager],
+    [manager, resetStats],
   );
 
-  const connectFoundDevice = useCallback(
+  const connectBleDevice = useCallback(
     async (scannedDevice: Device): Promise<void> => {
       setConnectionState('connecting');
-      setStatusText(`Łączenie z ${scannedDevice.localName ?? scannedDevice.name ?? scannedDevice.id}…`);
+      setStatusText(
+        `Łączenie BLE z ${scannedDevice.localName ?? scannedDevice.name ?? scannedDevice.id}…`,
+      );
 
       let device = await scannedDevice.connect({
         autoConnect: false,
         timeout: BLE_CONFIG.connectionTimeoutMs,
       });
-      connectedDeviceIdRef.current = device.id;
+      connectedBleDeviceIdRef.current = device.id;
 
       try {
         device = await manager.requestConnectionPriorityForDevice(
@@ -457,10 +749,10 @@ export default function App() {
           ConnectionPriority.High,
           'ecumaster-high-priority',
         );
-        setStatusText('Połączono; wysłano żądanie CONNECTION_PRIORITY_HIGH.');
+        setStatusText('Połączono BLE; wysłano żądanie CONNECTION_PRIORITY_HIGH.');
       } catch (error) {
         setStatusText(
-          `Połączono, ale żądanie high priority zwróciło błąd: ${ErrorDescription(error)}`,
+          `Połączono BLE, ale żądanie high priority zwróciło błąd: ${errorDescription(error)}`,
         );
       }
 
@@ -470,18 +762,18 @@ export default function App() {
           BLE_CONFIG.requestedMtu,
           'ecumaster-request-mtu',
         );
-        setStatusText(`High priority zażądane; MTU zwrócone przez bibliotekę: ${device.mtu}.`);
+        setStatusText(`BLE high priority zażądane; MTU zwrócone przez bibliotekę: ${device.mtu}.`);
       } catch (error) {
-        setStatusText(`High priority zażądane; MTU request error: ${ErrorDescription(error)}`);
+        setStatusText(`BLE high priority zażądane; MTU request error: ${errorDescription(error)}`);
       }
 
-      await installMonitor(device, scannedDevice.rssi ?? null);
+      await installBleMonitor(device, scannedDevice.rssi ?? null);
     },
-    [installMonitor, manager],
+    [installBleMonitor, manager],
   );
 
-  const startScan = useCallback(async () => {
-    if (connectingRef.current || connectedDeviceIdRef.current !== null) {
+  const startBleScan = useCallback(async () => {
+    if (connectingRef.current || connectedTransportRef.current !== null) {
       return;
     }
 
@@ -489,10 +781,10 @@ export default function App() {
     setErrorText(null);
     setConnectedInfo(null);
     removeSubscriptions();
-    stopScan();
-    discoveredDeviceObjectsRef.current.clear();
-    discoveredRowsRef.current.clear();
-    setScanDevices([]);
+    stopAllScans();
+    discoveredBleObjectsRef.current.clear();
+    discoveredBleRowsRef.current.clear();
+    setBleScanDevices([]);
 
     try {
       const permissionsGranted = await requestAndroidPermissions();
@@ -502,170 +794,467 @@ export default function App() {
 
       setConnectionState('waiting-for-bluetooth');
       setStatusText('Oczekiwanie na Bluetooth PoweredOn…');
-      await waitForPoweredOn(manager);
+      await waitForBlePoweredOn(manager);
 
       setConnectionState('scanning');
       setStatusText(
-        `Skanowanie wszystkich urządzeń BLE przez ${BLE_CONFIG.scanTimeoutMs / 1000} s. Wybór urządzenia jest ręczny.`,
+        `Skanowanie wszystkich urządzeń BLE przez ${BLE_CONFIG.scanTimeoutMs / 1000} s.`,
       );
 
-      scanUiTimerRef.current = setInterval(() => {
-        refreshScanList();
-      }, 300);
-
-      scanTimeoutRef.current = setTimeout(() => {
-        finishScan();
-      }, BLE_CONFIG.scanTimeoutMs);
+      bleScanUiTimerRef.current = setInterval(refreshBleScanList, 300);
+      bleScanTimeoutRef.current = setTimeout(() => finishBleScan(), BLE_CONFIG.scanTimeoutMs);
 
       await manager.startDeviceScan(
         null,
-        {
-          scanMode: ScanMode.LowLatency,
-          // Domyślny legacyScan=true jest celowo zachowany: Bolutek nadaje klasyczny advertisement.
-          // Brak filtra UUID/nazwy/MAC — pokazujemy wszystko, co zwróci Android.
-        },
+        { scanMode: ScanMode.LowLatency },
         (error, device) => {
           if (error !== null) {
-            stopScan();
+            stopBleScan();
             setConnectionState('error');
-            setErrorText(ErrorDescription(error));
+            setErrorText(errorDescription(error));
             return;
           }
-
           if (device === null) {
             return;
           }
-
-          discoveredDeviceObjectsRef.current.set(device.id, device);
-          discoveredRowsRef.current.set(device.id, deviceToRow(device));
+          discoveredBleObjectsRef.current.set(device.id, device);
+          discoveredBleRowsRef.current.set(device.id, bleDeviceToRow(device));
         },
       );
     } catch (error) {
-      stopScan();
+      stopBleScan();
       setConnectionState('error');
-      setErrorText(ErrorDescription(error));
+      setErrorText(errorDescription(error));
     }
-  }, [finishScan, manager, refreshScanList, removeSubscriptions, stopScan]);
+  }, [finishBleScan, manager, refreshBleScanList, removeSubscriptions, stopAllScans, stopBleScan]);
 
-  const connectSelectedDevice = useCallback(
-    async (deviceId: string) => {
-      if (connectingRef.current || connectedDeviceIdRef.current !== null) {
-        return;
+  const startSppScan = useCallback(async () => {
+    if (connectingRef.current || connectedTransportRef.current !== null) {
+      return;
+    }
+
+    intentionalDisconnectRef.current = false;
+    setErrorText(null);
+    setConnectedInfo(null);
+    removeSubscriptions();
+    stopAllScans();
+    discoveredSppObjectsRef.current.clear();
+    discoveredSppRowsRef.current.clear();
+    setSppScanDevices([]);
+
+    const generation = classicScanGenerationRef.current + 1;
+    classicScanGenerationRef.current = generation;
+
+    try {
+      const permissionsGranted = await requestAndroidPermissions();
+      if (!permissionsGranted) {
+        throw new Error('Brak uprawnień Bluetooth wymaganych do skanowania i połączenia SPP.');
       }
 
-      const device = discoveredDeviceObjectsRef.current.get(deviceId);
+      setConnectionState('waiting-for-bluetooth');
+      setStatusText('Sprawdzanie Bluetooth Classic…');
+      await ensureClassicBluetoothReady();
+
+      const bonded = await ClassicBluetooth.getBondedDevices();
+      mergeSppDevices(bonded, true);
+
+      setConnectionState('scanning');
+      setStatusText(
+        `SPP: pokazano ${bonded.length} sparowanych urządzeń. Trwa discovery urządzeń Classic/DUAL…`,
+      );
+
+      const discovered = await ClassicBluetooth.startDiscovery();
+      if (classicScanGenerationRef.current !== generation) {
+        return;
+      }
+      mergeSppDevices(discovered, false);
+      setConnectionState('scan-results');
+      setStatusText(
+        'Skan SPP zakończony. Sparowane urządzenia są na górze; niesparowane można sparować przy połączeniu.',
+      );
+    } catch (error) {
+      if (classicScanGenerationRef.current !== generation) {
+        return;
+      }
+      setConnectionState('error');
+      setErrorText(errorDescription(error));
+    }
+  }, [mergeSppDevices, removeSubscriptions, stopAllScans]);
+
+  const connectSelectedBleDevice = useCallback(
+    async (deviceId: string) => {
+      if (connectingRef.current || connectedTransportRef.current !== null) {
+        return;
+      }
+      const device = discoveredBleObjectsRef.current.get(deviceId);
       if (device === undefined) {
         setConnectionState('error');
-        setErrorText('Wybrane urządzenie nie jest już dostępne w pamięci skanera. Uruchom skan ponownie.');
+        setErrorText('Wybrane urządzenie BLE nie jest już dostępne. Uruchom skan ponownie.');
         return;
       }
 
       intentionalDisconnectRef.current = false;
       connectingRef.current = true;
       setErrorText(null);
-      stopScan();
+      stopAllScans();
 
       try {
-        await connectFoundDevice(device);
+        await connectBleDevice(device);
       } catch (connectError) {
-        const failedDeviceId = connectedDeviceIdRef.current;
+        const failedDeviceId = connectedBleDeviceIdRef.current;
         if (failedDeviceId !== null) {
           void manager.cancelDeviceConnection(failedDeviceId).catch(() => undefined);
         }
-        connectedDeviceIdRef.current = null;
+        connectedBleDeviceIdRef.current = null;
+        connectedTransportRef.current = null;
         connectingRef.current = false;
         setConnectionState('error');
-        setErrorText(ErrorDescription(connectError));
+        setErrorText(errorDescription(connectError));
       }
     },
-    [connectFoundDevice, manager, stopScan],
+    [connectBleDevice, manager, stopAllScans],
+  );
+
+  const installSppReceiver = useCallback(
+    (device: ClassicDeviceLike, row: SppScanDeviceRow, secureSocket: boolean): void => {
+      resetStats();
+      const address = classicAddress(device);
+      connectedSppDeviceRef.current = device;
+      connectedTransportRef.current = 'spp';
+
+      setConnectedInfo({
+        transport: 'spp',
+        id: device.id ?? address,
+        address,
+        name: classicDeviceName(device),
+        bonded: true,
+        deviceType: classicDeviceType(device),
+        scanRssi: row.rssi,
+        secureSocket,
+        readSize: SPP_READ_SIZE,
+        connectedAtIso: new Date().toISOString(),
+      });
+
+      classicDataSubscriptionRef.current = device.onDataReceived((event) => {
+        const callbackStartedAt = monotonicNowMs();
+        try {
+          if (typeof event.data !== 'string' || event.data.length === 0) {
+            return;
+          }
+          const decoded = decodeClassicPayload(event.data);
+          if (classicRxEncodingRef.current === 'unknown') {
+            classicRxEncodingRef.current = decoded.encoding;
+          }
+          if (decoded.payload.length > 0) {
+            collectorRef.current.ingestNotification(decoded.payload, callbackStartedAt);
+          }
+        } catch {
+          transportDecodeErrorsRef.current += 1;
+        } finally {
+          collectorRef.current.recordCallbackDuration(monotonicNowMs() - callbackStartedAt);
+        }
+      });
+
+      classicDisconnectSubscriptionRef.current = ClassicBluetooth.onDeviceDisconnected((event) => {
+        const eventAddress = event.device?.address ?? event.device?.id;
+        if (
+          eventAddress !== undefined &&
+          eventAddress.toUpperCase() !== address.toUpperCase()
+        ) {
+          return;
+        }
+        connectedSppDeviceRef.current = null;
+        connectedTransportRef.current = null;
+        connectingRef.current = false;
+        classicDataSubscriptionRef.current?.remove();
+        classicDataSubscriptionRef.current = null;
+        setConnectionState('disconnected');
+        setStatusText(
+          intentionalDisconnectRef.current
+            ? 'Rozłączono SPP ręcznie.'
+            : 'Połączenie SPP zostało przerwane.',
+        );
+      });
+
+      classicErrorSubscriptionRef.current = ClassicBluetooth.onError((event) => {
+        const eventAddress = event.device?.address ?? event.device?.id;
+        if (
+          eventAddress !== undefined &&
+          eventAddress.toUpperCase() !== address.toUpperCase()
+        ) {
+          return;
+        }
+        if (!intentionalDisconnectRef.current) {
+          setErrorText(event.message ?? 'Natywna warstwa Bluetooth Classic zgłosiła błąd.');
+        }
+      });
+
+      connectingRef.current = false;
+      setConnectionState('receiving');
+      setStatusText(
+        `SPP: odbieranie binarnego strumienia RFCOMM, READ_SIZE=${SPP_READ_SIZE}, socket ${
+          secureSocket ? 'secure' : 'insecure'
+        }.`,
+      );
+    },
+    [resetStats],
+  );
+
+  const connectSelectedSppDevice = useCallback(
+    async (address: string) => {
+      if (connectingRef.current || connectedTransportRef.current !== null) {
+        return;
+      }
+      const initialDevice = discoveredSppObjectsRef.current.get(address);
+      const row = discoveredSppRowsRef.current.get(address);
+      if (initialDevice === undefined || row === undefined) {
+        setConnectionState('error');
+        setErrorText('Wybrane urządzenie SPP nie jest już dostępne. Uruchom skan ponownie.');
+        return;
+      }
+
+      intentionalDisconnectRef.current = false;
+      connectingRef.current = true;
+      setErrorText(null);
+      stopBleScan();
+      await cancelSppDiscovery(true);
+
+      let device = initialDevice;
+      try {
+        if (!row.bonded && !Boolean(device.bonded)) {
+          setConnectionState('pairing');
+          setStatusText(`Parowanie SPP z ${row.name} (${address})…`);
+          device = await ClassicBluetooth.pairDevice(address);
+          mergeSppDevices([device], true);
+        }
+
+        setConnectionState('connecting');
+        setStatusText(`Łączenie SPP/RFCOMM z ${classicDeviceName(device)} (${address})…`);
+
+        try {
+          if (await device.isConnected()) {
+            await device.disconnect();
+          }
+        } catch {
+          // Kontynuujemy próbę połączenia w żądanym trybie binarnym.
+        }
+
+        const commonOptions: Record<string, unknown> = {
+          CONNECTOR_TYPE: 'rfcomm',
+          CONNECTION_TYPE: 'binary',
+          READ_SIZE: SPP_READ_SIZE,
+          READ_TIMEOUT: 0,
+        };
+
+        let secureSocket = true;
+        let connected = false;
+        let secureError: unknown = null;
+        try {
+          connected = await device.connect({ ...commonOptions, SECURE_SOCKET: true });
+        } catch (error) {
+          secureError = error;
+        }
+
+        if (!connected) {
+          try {
+            await device.disconnect();
+          } catch {
+            // Socket mógł nie zostać utworzony.
+          }
+          setStatusText(
+            `Secure RFCOMM nie połączył się (${errorDescription(
+              secureError,
+            )}). Próba insecure RFCOMM…`,
+          );
+          secureSocket = false;
+          connected = await device.connect({ ...commonOptions, SECURE_SOCKET: false });
+        }
+
+        if (!connected) {
+          throw new Error('Biblioteka zwróciła false podczas łączenia SPP.');
+        }
+
+        installSppReceiver(device, { ...row, bonded: true }, secureSocket);
+      } catch (error) {
+        try {
+          await device.disconnect();
+        } catch {
+          // Ignorujemy błąd sprzątania po nieudanym connect.
+        }
+        connectedSppDeviceRef.current = null;
+        connectedTransportRef.current = null;
+        connectingRef.current = false;
+        setConnectionState('error');
+        setErrorText(errorDescription(error));
+      }
+    },
+    [cancelSppDiscovery, installSppReceiver, mergeSppDevices, stopBleScan],
   );
 
   const disconnect = useCallback(async () => {
     intentionalDisconnectRef.current = true;
-    stopScan();
+    stopAllScans();
     removeSubscriptions();
-    const deviceId = connectedDeviceIdRef.current;
-    connectedDeviceIdRef.current = null;
+    const currentTransport = connectedTransportRef.current;
+    connectedTransportRef.current = null;
     connectingRef.current = false;
-    if (deviceId === null) {
-      setConnectionState('disconnected');
-      setStatusText('Brak aktywnego połączenia.');
-      return;
-    }
 
     setConnectionState('disconnecting');
-    try {
-      await manager.cancelDeviceConnection(deviceId);
-    } catch {
-      // Połączenie mogło już zostać zamknięte przez system.
+    if (currentTransport === 'ble') {
+      const deviceId = connectedBleDeviceIdRef.current;
+      connectedBleDeviceIdRef.current = null;
+      if (deviceId !== null) {
+        try {
+          await manager.cancelDeviceConnection(deviceId);
+        } catch {
+          // Połączenie mogło już zostać zamknięte przez system.
+        }
+      }
+    } else if (currentTransport === 'spp') {
+      const device = connectedSppDeviceRef.current;
+      connectedSppDeviceRef.current = null;
+      if (device !== null) {
+        try {
+          await device.disconnect();
+        } catch {
+          // Połączenie mogło już zostać zamknięte przez system.
+        }
+      }
     }
-    setConnectionState('disconnected');
-    setStatusText('Rozłączono ręcznie. Możesz ponownie uruchomić skan BLE.');
-  }, [manager, removeSubscriptions, stopScan]);
 
-  const resetStats = useCallback(() => {
-    collectorRef.current.reset(monotonicNowMs());
-    setStats(emptySnapshot());
-  }, []);
+    setConnectionState('disconnected');
+    setStatusText('Rozłączono ręcznie. Możesz ponownie uruchomić skan.');
+  }, [manager, removeSubscriptions, stopAllScans]);
+
+  const changeTransport = useCallback(
+    (nextTransport: TransportMode) => {
+      if (nextTransport === transportMode || connectedTransportRef.current !== null) {
+        return;
+      }
+      stopAllScans();
+      removeSubscriptions();
+      connectingRef.current = false;
+      setTransportMode(nextTransport);
+      setConnectionState('idle');
+      setConnectedInfo(null);
+      setErrorText(null);
+      resetStats();
+      setStatusText(
+        nextTransport === 'ble'
+          ? 'Wybrano BLE/GATT. Kliknij „Skanuj BLE”.'
+          : 'Wybrano SPP/Classic. Sparowane urządzenia pojawią się od razu po rozpoczęciu skanu.',
+      );
+    },
+    [removeSubscriptions, resetStats, stopAllScans, transportMode],
+  );
+
+  const startSelectedScan = useCallback(async () => {
+    if (transportMode === 'ble') {
+      await startBleScan();
+    } else {
+      await startSppScan();
+    }
+  }, [startBleScan, startSppScan, transportMode]);
+
+  const stopSelectedScan = useCallback(() => {
+    if (transportMode === 'ble') {
+      finishBleScan('Skan BLE zatrzymany ręcznie.');
+    } else {
+      finishSppScan('Skan SPP zatrzymany ręcznie.');
+    }
+  }, [finishBleScan, finishSppScan, transportMode]);
 
   const shareReport = useCallback(async () => {
+    const infoLines: Array<string | null> = [];
+    if (connectedInfo?.transport === 'ble') {
+      infoLines.push(
+        'transport=BLE_GATT',
+        `connected_at=${connectedInfo.connectedAtIso}`,
+        `device=${connectedInfo.name} ${connectedInfo.id}`,
+        `scan_rssi=${connectedInfo.scanRssi ?? '—'} dBm`,
+        `mtu=${connectedInfo.mtu}`,
+        `service=${connectedInfo.serviceUuid}`,
+        `notify=${connectedInfo.notifyCharacteristicUuid}`,
+      );
+    } else if (connectedInfo?.transport === 'spp') {
+      infoLines.push(
+        'transport=SPP_RFCOMM',
+        `connected_at=${connectedInfo.connectedAtIso}`,
+        `device=${connectedInfo.name} ${connectedInfo.address}`,
+        `scan_rssi=${connectedInfo.scanRssi ?? '—'} dBm`,
+        `bonded=${connectedInfo.bonded}`,
+        `device_type=${connectedInfo.deviceType}`,
+        `secure_socket=${connectedInfo.secureSocket}`,
+        `read_size=${connectedInfo.readSize}`,
+        `rx_bridge_encoding=${classicRxEncoding}`,
+      );
+    } else {
+      infoLines.push(`transport_selected=${transportMode.toUpperCase()}`, 'device=—');
+    }
+
+    const eventName = transportMode === 'ble' ? 'notifications' : 'read_callbacks';
     const report = [
-      'ECUMaster BLE RX Stats v1.2',
+      'ECUMaster BT RX Stats v1.3',
       `generated=${new Date().toISOString()}`,
       `state=${connectionState}`,
       `status=${statusText}`,
-      connectedInfo ? `connected_at=${connectedInfo.connectedAtIso}` : null,
-      connectedInfo ? `device=${connectedInfo.name} ${connectedInfo.id}` : 'device=—',
-      connectedInfo ? `scanRssi=${connectedInfo.scanRssi ?? '—'} dBm` : null,
-      connectedInfo ? `mtu=${connectedInfo.mtu}` : null,
-      connectedInfo ? `service=${connectedInfo.serviceUuid}` : null,
-      connectedInfo ? `notify=${connectedInfo.notifyCharacteristicUuid}` : null,
+      ...infoLines,
       `elapsed_s=${stats.elapsedSeconds.toFixed(3)}`,
-      `notifications=${stats.notifications}`,
-      `notifications_per_s_avg=${stats.notificationsPerSecondAverage.toFixed(3)}`,
+      `${eventName}=${stats.notifications}`,
+      `${eventName}_per_s_avg=${stats.notificationsPerSecondAverage.toFixed(3)}`,
       `bytes=${stats.bytes}`,
       `bytes_per_s_avg=${stats.bytesPerSecondAverage.toFixed(3)}`,
       `frames=${stats.validFrames}`,
       `frames_per_s_avg=${stats.validFramesPerSecondAverage.toFixed(3)}`,
+      `transport_decode_errors=${transportDecodeErrors}`,
       `checksum_errors=${stats.checksumErrors}`,
       `resync_dropped_bytes=${stats.markerResyncDrops}`,
       `carry_bytes=${stats.carryBytes}`,
-      `non_multiple_of_5_notifications=${stats.notificationLengthsNotMultipleOf5}`,
-      `consecutive_exact_duplicate_notifications=${stats.exactConsecutiveDuplicateNotifications}`,
+      `chunks_not_multiple_of_5=${stats.notificationLengthsNotMultipleOf5}`,
+      `consecutive_exact_duplicate_chunks=${stats.exactConsecutiveDuplicateNotifications}`,
       `RPM_count=${stats.rpm.count} RPM_avg_hz=${stats.rpm.averageRateHz.toFixed(
         3,
-      )} RPM_delivery_pct=${stats.rpm.estimatedDeliveryPercent.toFixed(2)}`,
+      )} RPM_rate_vs_nominal_pct=${stats.rpm.estimatedDeliveryPercent.toFixed(2)}`,
       `IAT_count=${stats.iat.count} IAT_avg_hz=${stats.iat.averageRateHz.toFixed(
         3,
-      )} IAT_delivery_pct=${stats.iat.estimatedDeliveryPercent.toFixed(2)}`,
+      )} IAT_rate_vs_nominal_pct=${stats.iat.estimatedDeliveryPercent.toFixed(2)}`,
       `CLT_count=${stats.clt.count} CLT_avg_hz=${stats.clt.averageRateHz.toFixed(
         3,
-      )} CLT_delivery_pct=${stats.clt.estimatedDeliveryPercent.toFixed(2)}`,
+      )} CLT_rate_vs_nominal_pct=${stats.clt.estimatedDeliveryPercent.toFixed(2)}`,
       `RPM_to_CLT=${stats.rpmToCltRatio ?? '—'}`,
       `IAT_to_CLT=${stats.iatToCltRatio ?? '—'}`,
-      `notification_lengths=${stats.notificationLengthHistogram
+      `chunk_lengths=${stats.notificationLengthHistogram
         .map(([length, count]) => `${length}:${count}`)
         .join(',')}`,
-      `channel_counts=${stats.channelCounts
-        .map(([id, count]) => `${id}:${count}`)
-        .join(',')}`,
-      `notification_gap_ms=${JSON.stringify(stats.notificationGapMs)}`,
+      `channel_counts=${stats.channelCounts.map(([id, count]) => `${id}:${count}`).join(',')}`,
+      `chunk_gap_ms=${JSON.stringify(stats.notificationGapMs)}`,
       `callback_duration_ms=${JSON.stringify(stats.callbackDurationMs)}`,
       `js_event_loop_lag_ms=${JSON.stringify(stats.jsEventLoopLagMs)}`,
-      connectedInfo ? `characteristics=\n${connectedInfo.characteristicSummary}` : null,
+      connectedInfo?.transport === 'ble'
+        ? `characteristics=\n${connectedInfo.characteristicSummary}`
+        : null,
     ]
       .filter((line): line is string => line !== null)
       .join('\n');
 
-    await Share.share({ title: 'ECUMaster BLE RX Stats', message: report });
-  }, [connectedInfo, connectionState, stats, statusText]);
+    await Share.share({ title: 'ECUMaster BT RX Stats', message: report });
+  }, [
+    classicRxEncoding,
+    connectedInfo,
+    connectionState,
+    stats,
+    statusText,
+    transportDecodeErrors,
+    transportMode,
+  ]);
 
   useEffect(() => {
     void manager.setLogLevel(LogLevel.None).catch(() => undefined);
 
     const uiTimer = setInterval(() => {
       setStats(collectorRef.current.snapshot(monotonicNowMs()));
+      setTransportDecodeErrors(transportDecodeErrorsRef.current);
+      setClassicRxEncoding(classicRxEncodingRef.current);
     }, BLE_CONFIG.uiRefreshMs);
 
     const lagIntervalMs = 100;
@@ -684,30 +1273,41 @@ export default function App() {
       intentionalDisconnectRef.current = true;
       clearInterval(uiTimer);
       clearInterval(lagTimer);
-      stopScan();
+      stopBleScan();
+      void cancelSppDiscovery(true);
       removeSubscriptions();
-      const deviceId = connectedDeviceIdRef.current;
-      if (deviceId !== null) {
-        void manager.cancelDeviceConnection(deviceId).catch(() => undefined);
+      const bleDeviceId = connectedBleDeviceIdRef.current;
+      if (bleDeviceId !== null) {
+        void manager.cancelDeviceConnection(bleDeviceId).catch(() => undefined);
+      }
+      const sppDevice = connectedSppDeviceRef.current;
+      if (sppDevice !== null) {
+        void sppDevice.disconnect().catch(() => undefined);
       }
       void manager.destroy().catch(() => undefined);
     };
-  }, [manager, removeSubscriptions, stopScan]);
+  }, [cancelSppDiscovery, manager, removeSubscriptions, stopBleScan]);
 
   const isConnectionBusy = [
     'waiting-for-bluetooth',
+    'pairing',
     'connecting',
     'discovering',
     'subscribing',
     'receiving',
     'disconnecting',
   ].includes(connectionState);
-  const activeConnectionNeedsDisconnect = connectionState === 'error' && connectedInfo !== null;
-  const canDisconnect = isConnectionBusy || activeConnectionNeedsDisconnect;
+  const hasActiveConnection =
+    connectedTransportRef.current !== null || connectionState === 'receiving';
+  const canSwitchTransport =
+    !isConnectionBusy && connectionState !== 'scanning' && !hasActiveConnection;
   const canStartScan =
-    !isConnectionBusy && !activeConnectionNeedsDisconnect && connectionState !== 'scanning';
-  const canConnectFromList =
-    !connectingRef.current && connectedDeviceIdRef.current === null && connectionState !== 'receiving';
+    !isConnectionBusy && connectionState !== 'scanning' && !hasActiveConnection;
+  const canConnectFromList = !connectingRef.current && !hasActiveConnection;
+  const canDisconnect = isConnectionBusy || hasActiveConnection;
+
+  const eventLabel = transportMode === 'ble' ? 'notifications' : 'SPP read callbacks';
+  const callbackLabel = transportMode === 'ble' ? 'BLE callback' : 'SPP callback';
   const histogramText =
     stats.notificationLengthHistogram.length === 0
       ? '—'
@@ -719,25 +1319,75 @@ export default function App() {
     <SafeAreaView style={styles.safeArea}>
       <StatusBar barStyle="dark-content" backgroundColor="#f2f3f5" />
       <ScrollView contentContainerStyle={styles.container}>
-        <Text style={styles.title}>ECUMaster BLE RX Stats v1.2</Text>
+        <Text style={styles.title}>ECUMaster BT RX Stats v1.3</Text>
         <Text style={styles.subtitle}>
-          Najpierw skan wszystkich urządzeń BLE, potem ręczny wybór. Po połączeniu: High connection
-          priority, MTU request i test RX-only.
+          Minimalny miernik RX dla BLE/GATT i SPP/RFCOMM. Ten sam parser i te same statystyki dla obu transportów.
         </Text>
+
+        <View style={styles.card}>
+          <Text style={styles.sectionTitle}>Wybór transportu</Text>
+          <View style={styles.transportRow}>
+            <Pressable
+              onPress={() => changeTransport('ble')}
+              disabled={!canSwitchTransport}
+              style={[
+                styles.transportButton,
+                transportMode === 'ble' && styles.transportSelected,
+                !canSwitchTransport && styles.disabledControl,
+              ]}
+            >
+              <Text
+                style={[
+                  styles.transportText,
+                  transportMode === 'ble' && styles.transportSelectedText,
+                ]}
+              >
+                BLE / GATT
+              </Text>
+            </Pressable>
+            <Pressable
+              onPress={() => changeTransport('spp')}
+              disabled={!canSwitchTransport}
+              style={[
+                styles.transportButton,
+                transportMode === 'spp' && styles.transportSelected,
+                !canSwitchTransport && styles.disabledControl,
+              ]}
+            >
+              <Text
+                style={[
+                  styles.transportText,
+                  transportMode === 'spp' && styles.transportSelectedText,
+                ]}
+              >
+                SPP / RFCOMM
+              </Text>
+            </Pressable>
+          </View>
+          <Text style={styles.note}>
+            Wybrano: {transportMode === 'ble' ? 'BLE/GATT' : 'SPP/RFCOMM'}. Transport można zmienić po zatrzymaniu skanu lub rozłączeniu.
+          </Text>
+        </View>
 
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>Połączenie</Text>
           <Text style={styles.status}>{connectionState}</Text>
           <Text style={styles.bodyText}>{statusText}</Text>
-          {['waiting-for-bluetooth', 'connecting', 'discovering', 'subscribing'].includes(
-            connectionState,
-          ) ? (
+          {[
+            'waiting-for-bluetooth',
+            'scanning',
+            'pairing',
+            'connecting',
+            'discovering',
+            'subscribing',
+          ].includes(connectionState) ? (
             <ActivityIndicator style={styles.spinner} />
           ) : null}
           {errorText !== null ? <Text style={styles.error}>{errorText}</Text> : null}
 
-          {connectedInfo !== null ? (
+          {connectedInfo?.transport === 'ble' ? (
             <View style={styles.infoBlock}>
+              <Text style={styles.mono}>transport: BLE/GATT</Text>
               <Text style={styles.mono}>device: {connectedInfo.name}</Text>
               <Text style={styles.mono}>id: {connectedInfo.id}</Text>
               <Text style={styles.mono}>scan RSSI: {connectedInfo.scanRssi ?? '—'} dBm</Text>
@@ -747,14 +1397,30 @@ export default function App() {
             </View>
           ) : null}
 
+          {connectedInfo?.transport === 'spp' ? (
+            <View style={styles.infoBlock}>
+              <Text style={styles.mono}>transport: SPP/RFCOMM</Text>
+              <Text style={styles.mono}>device: {connectedInfo.name}</Text>
+              <Text style={styles.mono}>address: {connectedInfo.address}</Text>
+              <Text style={styles.mono}>type: {connectedInfo.deviceType}</Text>
+              <Text style={styles.mono}>socket: {connectedInfo.secureSocket ? 'secure' : 'insecure'}</Text>
+              <Text style={styles.mono}>READ_SIZE: {connectedInfo.readSize}</Text>
+              <Text style={styles.mono}>bridge encoding: {classicRxEncoding}</Text>
+            </View>
+          ) : null}
+
           <View style={styles.buttonRow}>
             <View style={styles.buttonCell}>
-              <Button title="Skanuj BLE" onPress={() => void startScan()} disabled={!canStartScan} />
+              <Button
+                title={transportMode === 'ble' ? 'Skanuj BLE' : 'Skanuj SPP'}
+                onPress={() => void startSelectedScan()}
+                disabled={!canStartScan}
+              />
             </View>
             <View style={styles.buttonCell}>
               <Button
                 title="Zatrzymaj skan"
-                onPress={() => finishScan('Skan zatrzymany ręcznie. Wybierz urządzenie z listy.')}
+                onPress={stopSelectedScan}
                 disabled={connectionState !== 'scanning'}
               />
             </View>
@@ -773,40 +1439,80 @@ export default function App() {
         </View>
 
         <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Znalezione urządzenia BLE ({scanDevices.length})</Text>
-          <Text style={styles.note}>
-            Lista nie filtruje po nazwie, MAC ani UUID. RSSI jest z ostatniego advertisement zwróconego
-            przez Androida. Najsilniejsze urządzenia są na górze.
+          <Text style={styles.sectionTitle}>
+            {transportMode === 'ble' ? 'Znalezione urządzenia BLE' : 'Urządzenia SPP / Classic'} ({
+              transportMode === 'ble' ? bleScanDevices.length : sppScanDevices.length
+            })
           </Text>
-          {connectionState === 'scanning' ? <ActivityIndicator style={styles.spinner} /> : null}
-          {scanDevices.length === 0 ? (
+
+          {transportMode === 'ble' ? (
             <Text style={styles.note}>
-              {connectionState === 'scanning'
-                ? 'Czekam na advertisementy BLE…'
-                : 'Brak wyników. Kliknij „Skanuj BLE”.'}
+              Lista nie filtruje po nazwie, MAC ani UUID. Najsilniejsze urządzenia są na górze.
             </Text>
           ) : (
-            scanDevices.map((device) => (
-              <View key={device.id} style={styles.deviceBox}>
-                <Text style={styles.deviceName}>{deviceDisplayName(device)}</Text>
-                {device.name !== null && device.localName !== null && device.name !== device.localName ? (
-                  <Text style={styles.mono}>name: {device.name}</Text>
-                ) : null}
-                <Text style={styles.mono}>id: {device.id}</Text>
+            <Text style={styles.note}>
+              Urządzenia sparowane pojawiają się od razu na górze. Pełne discovery Bluetooth Classic może trwać kilkanaście sekund.
+            </Text>
+          )}
+
+          {connectionState === 'scanning' ? <ActivityIndicator style={styles.spinner} /> : null}
+
+          {transportMode === 'ble' ? (
+            bleScanDevices.length === 0 ? (
+              <Text style={styles.note}>
+                {connectionState === 'scanning'
+                  ? 'Czekam na advertisementy BLE…'
+                  : 'Brak wyników. Kliknij „Skanuj BLE”.'}
+              </Text>
+            ) : (
+              bleScanDevices.map((device) => (
+                <View key={device.id} style={styles.deviceBox}>
+                  <Text style={styles.deviceName}>{bleDeviceDisplayName(device)}</Text>
+                  {device.name !== null &&
+                  device.localName !== null &&
+                  device.name !== device.localName ? (
+                    <Text style={styles.mono}>name: {device.name}</Text>
+                  ) : null}
+                  <Text style={styles.mono}>id: {device.id}</Text>
+                  <Text style={styles.mono}>
+                    RSSI: {device.rssi ?? '—'} dBm | connectable:{' '}
+                    {device.isConnectable === null ? '—' : device.isConnectable ? 'yes' : 'no'}
+                  </Text>
+                  <Text style={styles.mono}>
+                    advertised services:{' '}
+                    {device.serviceUUIDs === null || device.serviceUUIDs.length === 0
+                      ? '—'
+                      : device.serviceUUIDs.join(', ')}
+                  </Text>
+                  <View style={styles.deviceButton}>
+                    <Button
+                      title="Połącz BLE z tym urządzeniem"
+                      onPress={() => void connectSelectedBleDevice(device.id)}
+                      disabled={!canConnectFromList}
+                    />
+                  </View>
+                </View>
+              ))
+            )
+          ) : sppScanDevices.length === 0 ? (
+            <Text style={styles.note}>
+              {connectionState === 'scanning'
+                ? 'Czekam na wynik discovery SPP…'
+                : 'Brak wyników. Najlepiej najpierw sparuj moduł w ustawieniach Androida, potem kliknij „Skanuj SPP”.'}
+            </Text>
+          ) : (
+            sppScanDevices.map((device) => (
+              <View key={device.address} style={styles.deviceBox}>
+                <Text style={styles.deviceName}>{device.name}</Text>
+                <Text style={styles.mono}>address: {device.address}</Text>
                 <Text style={styles.mono}>
-                  RSSI: {device.rssi ?? '—'} dBm | connectable:{' '}
-                  {device.isConnectable === null ? '—' : device.isConnectable ? 'yes' : 'no'}
-                </Text>
-                <Text style={styles.mono}>
-                  advertised services:{' '}
-                  {device.serviceUUIDs === null || device.serviceUUIDs.length === 0
-                    ? '—'
-                    : device.serviceUUIDs.join(', ')}
+                  bonded: {device.bonded ? 'yes' : 'no'} | type: {device.type} | RSSI:{' '}
+                  {device.rssi ?? '—'} dBm
                 </Text>
                 <View style={styles.deviceButton}>
                   <Button
-                    title="Połącz z tym urządzeniem"
-                    onPress={() => void connectSelectedDevice(device.id)}
+                    title="Połącz SPP z tym urządzeniem"
+                    onPress={() => void connectSelectedSppDevice(device.address)}
                     disabled={!canConnectFromList}
                   />
                 </View>
@@ -819,7 +1525,7 @@ export default function App() {
           <Text style={styles.sectionTitle}>Transport</Text>
           <Text style={styles.mono}>czas: {formatNumber(stats.elapsedSeconds, 1)} s</Text>
           <Text style={styles.mono}>
-            notifications: {stats.notifications} | avg{' '}
+            {eventLabel}: {stats.notifications} | avg{' '}
             {formatNumber(stats.notificationsPerSecondAverage, 2)}/s | last 1s{' '}
             {stats.notificationsPerSecond1s}/s
           </Text>
@@ -828,29 +1534,34 @@ export default function App() {
             {stats.bytesPerSecond1s} B/s
           </Text>
           <Text style={styles.mono}>
-            valid frames: {stats.validFrames} | avg {formatNumber(
-              stats.validFramesPerSecondAverage,
-              2,
-            )}/s | last 1s {stats.validFramesPerSecond1s}/s
+            valid frames: {stats.validFrames} | avg{' '}
+            {formatNumber(stats.validFramesPerSecondAverage, 2)}/s | last 1s{' '}
+            {stats.validFramesPerSecond1s}/s
           </Text>
           <Text style={styles.mono}>length histogram: {histogramText}</Text>
           <Text style={styles.mono}>active channel IDs: {stats.channelCounts.length}</Text>
           <Text style={styles.mono}>
-            notification gaps [ms]: {formatDistribution(stats.notificationGapMs)}
+            callback gaps [ms]: {formatDistribution(stats.notificationGapMs)}
           </Text>
         </View>
 
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>Integralność parsera</Text>
+          <Text style={styles.mono}>transport decode errors: {transportDecodeErrors}</Text>
           <Text style={styles.mono}>checksum errors: {stats.checksumErrors}</Text>
           <Text style={styles.mono}>resync dropped bytes: {stats.markerResyncDrops}</Text>
           <Text style={styles.mono}>carry bytes: {stats.carryBytes}</Text>
           <Text style={styles.mono}>
-            notification len % 5 != 0: {stats.notificationLengthsNotMultipleOf5}
+            chunk len % 5 != 0: {stats.notificationLengthsNotMultipleOf5}
           </Text>
           <Text style={styles.mono}>
-            exact consecutive duplicate notifications: {stats.exactConsecutiveDuplicateNotifications}
+            exact consecutive duplicate chunks: {stats.exactConsecutiveDuplicateNotifications}
           </Text>
+          {transportMode === 'spp' ? (
+            <Text style={styles.note}>
+              W SPP granice callbacków są dowolne, dlatego długość niepodzielna przez 5 jest normalna. Parser zachowuje końcówkę i łączy ją z następnym callbackiem.
+            </Text>
+          ) : null}
         </View>
 
         <View style={styles.card}>
@@ -865,32 +1576,42 @@ export default function App() {
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>Obciążenie aplikacji</Text>
           <Text style={styles.mono}>
-            BLE callback [ms]: {formatDistribution(stats.callbackDurationMs)}
+            {callbackLabel} [ms]: {formatDistribution(stats.callbackDurationMs)}
           </Text>
           <Text style={styles.mono}>
             JS event-loop lag [ms]: {formatDistribution(stats.jsEventLoopLagMs)}
           </Text>
           <Text style={styles.note}>
-            Po połączeniu skan jest zatrzymany. UI statystyk odświeża się tylko 2 razy/s. Callback BLE
-            wyłącznie dekoduje Base64, aktualizuje liczniki i wraca — brak setState, console.log, zapisu
-            pliku i operacji TX dla każdej notyfikacji.
+            UI odświeża się tylko 2 razy/s. Callback odbiorczy wyłącznie dekoduje dane, aktualizuje liczniki i wraca — bez logowania, zapisu pliku i setState dla każdej ramki.
           </Text>
         </View>
 
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>Założenia testu</Text>
-          <Text style={styles.mono}>scan filter: NONE</Text>
-          <Text style={styles.mono}>scan mode: LowLatency</Text>
-          <Text style={styles.mono}>device selection: manual</Text>
-          <Text style={styles.mono}>requested MTU: {BLE_CONFIG.requestedMtu}</Text>
-          <Text style={styles.mono}>connection priority: HIGH</Text>
+          {transportMode === 'ble' ? (
+            <>
+              <Text style={styles.mono}>transport: BLE/GATT notifications</Text>
+              <Text style={styles.mono}>scan filter: NONE</Text>
+              <Text style={styles.mono}>scan mode: LowLatency</Text>
+              <Text style={styles.mono}>requested MTU: {BLE_CONFIG.requestedMtu}</Text>
+              <Text style={styles.mono}>connection priority: HIGH</Text>
+            </>
+          ) : (
+            <>
+              <Text style={styles.mono}>transport: Bluetooth Classic SPP/RFCOMM</Text>
+              <Text style={styles.mono}>connection type: binary</Text>
+              <Text style={styles.mono}>READ_SIZE: {SPP_READ_SIZE}</Text>
+              <Text style={styles.mono}>READ_TIMEOUT: 0</Text>
+              <Text style={styles.mono}>secure socket with insecure fallback</Text>
+              <Text style={styles.mono}>RX bridge encoding: {classicRxEncoding}</Text>
+            </>
+          )}
           <Text style={styles.mono}>
             expected: RPM {BLE_CONFIG.expectedRatesHz.rpm} Hz, IAT/CLT{' '}
             {BLE_CONFIG.expectedRatesHz.clt} Hz
           </Text>
           <Text style={styles.note}>
-            „delivery %” jest estymacją z deklarowanych częstotliwości. Bez licznika sekwencyjnego w
-            protokole nie da się bezpośrednio policzyć utraconych notyfikacji.
+            „rate vs nominal” jest estymacją z deklarowanych częstotliwości. Bez licznika sekwencyjnego w protokole nie da się bezpośrednio policzyć utraconych pakietów.
           </Text>
         </View>
       </ScrollView>
@@ -960,6 +1681,34 @@ const styles = StyleSheet.create({
   },
   singleButtonRow: {
     marginTop: 6,
+  },
+  transportRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  transportButton: {
+    flex: 1,
+    paddingVertical: 12,
+    paddingHorizontal: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: '#9ca3af',
+    borderRadius: 8,
+    alignItems: 'center',
+    backgroundColor: '#f3f4f6',
+  },
+  transportSelected: {
+    backgroundColor: '#2196f3',
+    borderColor: '#2196f3',
+  },
+  transportText: {
+    fontWeight: '700',
+    color: '#111827',
+  },
+  transportSelectedText: {
+    color: '#ffffff',
+  },
+  disabledControl: {
+    opacity: 0.5,
   },
   mono: {
     fontFamily: Platform.select({ android: 'monospace', default: 'Courier' }),
